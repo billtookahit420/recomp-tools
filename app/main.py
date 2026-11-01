@@ -97,7 +97,11 @@ The header shows the toolbox check. Needed: Python 3, CMake, Ninja, a
 C/C++ compiler, MinGW-w64 for Windows builds, nm, zip. On Linux the
 missing system packages can be installed with one password prompt:
   pkexec apt install -y build-essential cmake ninja-build zip binutils \
-      gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 libgl-dev libssl-dev
+      gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 libgl-dev libssl-dev \
+      git python3-venv libfreetype-dev libharfbuzz-dev libxtst-dev \
+      libasound2-dev libpulse-dev libudev-dev libxext-dev libxrandr-dev \
+      libxcursor-dev libxi-dev libxss-dev libxkbcommon-dev libdrm-dev \
+      libgbm-dev libegl-dev libdbus-1-dev
 Re-check after installing. The RetroAchievements module is bundled
 with the app. The PSXRecomp framework is downloaded automatically
 on first use into the app's framework-cache folder (needs git and
