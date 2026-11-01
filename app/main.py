@@ -84,6 +84,16 @@ OPTIONS
   (softcore); that's their policy for unknown clients, not a bug here.
 - Renderer default / aspect / controller mode: written into the
   packaged config; changeable later in the launcher.
+- Renderer = Vulkan: builds the real Vulkan backend, which needs
+  the Vulkan SDK on THIS machine at build time (headers + glslc;
+  apt: libvulkan-dev glslang-tools). Without it the build stops
+  with that message rather than shipping the framework's inert
+  stub. Achievement pop-ups draw only under OpenGL — with Vulkan
+  active they're off; players can switch the game to OpenGL in
+  its launcher and pop-ups return.
+- Cover art: the art fetched for the queue is bundled into the
+  package under artwork/<serial>/, which is where the game's own
+  launcher looks for it — so covers show in both places.
 - Build targets: Linux, Windows, or both.
 - Save states: OFF ships a config.ini that unbinds the save-state
   hotkeys (F7/F8). ON ships no config.ini (defaults apply).
@@ -101,7 +111,7 @@ missing system packages can be installed with one password prompt:
       git python3-venv libfreetype-dev libharfbuzz-dev libxtst-dev \
       libasound2-dev libpulse-dev libudev-dev libxext-dev libxrandr-dev \
       libxcursor-dev libxi-dev libxss-dev libxkbcommon-dev libdrm-dev \
-      libgbm-dev libegl-dev libdbus-1-dev
+      libgbm-dev libegl-dev libdbus-1-dev libvulkan-dev glslang-tools
 Re-check after installing. The RetroAchievements module is bundled
 with the app. The PSXRecomp framework is downloaded automatically
 on first use into the app's framework-cache folder (needs git and
@@ -149,7 +159,8 @@ class Worker(QThread):
                              title=item["title"].split(" (")[0],
                              work_dir=self.work_dir,
                              settings=self.settings,
-                             slug_override=item.get("slug", ""))
+                             slug_override=item.get("slug", ""),
+                             art=item.get("art", ""))
             try:
                 engine.run_job(job, self.log_line.emit)
                 self.item_status.emit(idx, "done")
@@ -304,8 +315,14 @@ class MainWindow(QMainWindow):
         ra_row.addWidget(b)
         f.addRow("RA toml file", ra_row)
         self.renderer_combo = QComboBox()
-        self.renderer_combo.addItems(["opengl", "software"])
+        self.renderer_combo.addItems(["opengl", "vulkan", "software"])
         f.addRow("Renderer default", self.renderer_combo)
+        self.renderer_hint = QLabel("")
+        self.renderer_hint.setWordWrap(True)
+        f.addRow("", self.renderer_hint)
+        self.renderer_combo.currentTextChanged.connect(
+            self._renderer_hint_update)
+        self._renderer_hint_update(self.renderer_combo.currentText())
         self.aspect_combo = QComboBox()
         self.aspect_combo.addItems(["4:3", "16:9", "stretch"])
         f.addRow("Aspect ratio", self.aspect_combo)
@@ -386,6 +403,22 @@ class MainWindow(QMainWindow):
                     else "Missing: " + ", ".join(missing))
         bits.append(f"template: {tmpl.name if tmpl else 'downloads on first use'}")
         self.toolbox_label.setText(" | ".join(bits))
+
+    def _renderer_hint_update(self, text):
+        if text == "vulkan":
+            self.renderer_hint.setText(
+                "Vulkan needs the Vulkan SDK (headers + glslc) on this "
+                "machine at build time; without it the build stops "
+                "instead of shipping a fake. RA pop-ups only draw "
+                "under OpenGL: they stay off while Vulkan is the "
+                "active renderer, per the pop-ups option — switch the "
+                "game to OpenGL in its launcher and they return.")
+        elif text == "software":
+            self.renderer_hint.setText(
+                "Software rendering is CPU-heavy (audio can suffer); "
+                "it's the fallback, not the fast path.")
+        else:
+            self.renderer_hint.setText("")
 
     def current_settings(self):
         return engine.JobSettings(
