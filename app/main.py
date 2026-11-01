@@ -62,13 +62,15 @@ keeps failures contained: a failed game is marked red, logged, and the
 queue moves on.
 
 MULTI-DISC GAMES
-Use "Add Disc Set" and pick every .cue of the set together. The set is
-probed and checked: if all discs boot the SAME program (Metal Gear
-Solid, Evil Dead), you get ONE package and the launcher offers disc
-selection. If the discs boot DIFFERENT programs (Resident Evil 2), the
-set is marked "needs review" - convert those discs one at a time as
-separate games. Anything unclear is parked as "needs review" too,
-never guessed.
+Just add the discs - one at a time with "Add Disc", or together with
+"Add Disc Set". Discs from the same folder with the same game title
+are grouped into ONE queue item automatically. When the set runs, it
+is probed and checked: if all discs boot the SAME program (Metal Gear
+Solid, Evil Dead, Driver 2), you get ONE package and the launcher
+offers disc selection. If the discs boot DIFFERENT programs
+(Resident Evil 2), each disc is converted as its own game
+automatically. Only a set that cannot be classified either way is
+parked as "needs review", never guessed.
 
 OPTIONS
 - Players override: 0 = trust the probe/setup default. The main menu
@@ -458,7 +460,44 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ queue
 
+    @staticmethod
+    def _set_key(cues):
+        """Discs of one set share a base title and a set root. Real
+        layouts scatter a set: both cues in one folder, each disc in
+        its own subfolder (d1/, d2/), or each in a folder named after
+        the disc itself - so climb past disc-named and title-named
+        folders to the folder the whole set lives under."""
+        title = engine.cue_title(cues[0])
+        folder = Path(cues[0]).parent
+        while folder.name and (
+                re.fullmatch(r"(?i)(d|disc|disk|cd)?\s*\d{1,2}",
+                             folder.name)
+                or engine.cue_title(folder.name) == title):
+            folder = folder.parent
+        return (str(folder), title)
+
     def _add_item(self, cues):
+        # Auto-group: however the discs are added - one at a time or
+        # all at once - discs of the same set land in ONE queue item.
+        key = self._set_key(cues)
+        for row, item in enumerate(self.items):
+            cell = self.table.item(row, 5)
+            if cell and cell.text() in ("done", "running"):
+                continue
+            if self._set_key(item["cues"]) != key:
+                continue
+            merged = sorted(set(item["cues"]) | set(cues))
+            if len(merged) == len(item["cues"]):
+                return                # every cue already queued
+            item["cues"] = merged
+            base = engine.cue_title(merged[0])
+            item["title"] = base + f" ({len(merged)} discs)"
+            item["probes"], item["verdict"] = [], {}
+            self._fill_row(row, item, "queued")
+            self._queue_probe(row, force=True)
+            self.log_line(f"grouped {len(merged)} discs of {base} "
+                          "into one set")
+            return
         base = engine.cue_title(cues[0])
         title = base
         if len(cues) > 1:
@@ -474,7 +513,7 @@ class MainWindow(QMainWindow):
         self._queue_probe(row)        # auto-probe every added disc/set
 
     def _fill_row(self, row, item, status):
-        probe = item["probes"][-1] if item["probes"] else {}
+        probe = item["probes"][0] if item["probes"] else {}
         vals = [item["title"], probe.get("serial", "?"),
                 str(self.players_spin.value() or "?"),
                 str(probe.get("track_count", "?")),
