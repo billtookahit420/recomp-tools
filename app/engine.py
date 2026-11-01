@@ -192,6 +192,7 @@ class Job:
     work_dir: str                    # parent dir; project root = work_dir/<slug>-recomp
     settings: JobSettings = field(default_factory=JobSettings)
     slug_override: str = ""
+    art: str = ""                    # cover art file to bundle (GUI-fetched)
     probes: list = field(default_factory=list)   # probe JSON dicts, per cue
     set_verdict: dict = field(default_factory=dict)
 
@@ -459,8 +460,12 @@ def _patch_first(path, subs):
 
 def stage_patch_cmake(r, job):
     repo = job.repo
-    # For a verified set, the build disc is the LAST cue (house pattern).
-    probe = job.probes[-1]
+    # For a verified set, the config/generate disc is the FIRST cue:
+    # the scaffold writes game.toml from it and Generate names its
+    # files after its boot EXE. (probes[-1] here named Driver 2's
+    # SLUS_013.18 while the generated files were SLUS_011.61_* — the
+    # glob matched nothing and the build linked zero game code.)
+    probe = job.probes[0]
     stem = probe["boot_exe"]                       # e.g. SLUS_009.84
     cm = repo / "CMakeLists.txt"
     players = job.settings.players or 1
@@ -582,6 +587,27 @@ def stage_generate(r, job):
     r.log(f"generated/ holds {n} C files")
 
 
+def vulkan_sdk_status():
+    """(headers_dir, glslc) — either may be None. The framework builds
+    the REAL Vulkan renderer only when Vulkan headers + glslc exist at
+    build time; without them gpu_vk_renderer.c compiles to an inert
+    stub that reports itself 'unavailable' at runtime."""
+    sdk = os.environ.get("VULKAN_SDK")
+    cands = []
+    if sdk:
+        cands += [Path(sdk) / "Include", Path(sdk) / "include"]
+    cands += [Path("/usr/include"), Path("/usr/local/include")]
+    headers = next((c for c in cands
+                    if (c / "vulkan" / "vulkan.h").exists()), None)
+    glslc = shutil.which("glslc")
+    if not glslc and sdk:
+        for sub in ("Bin", "bin"):
+            p = Path(sdk) / sub / "glslc"
+            if p.exists():
+                glslc = str(p)
+    return headers, glslc
+
+
 def stage_build(r, job, target):
     repo = job.repo
     s = job.settings
@@ -592,6 +618,20 @@ def stage_build(r, job, target):
     else:
         bdir = repo / "build-windows"
         extra = ["-DCMAKE_TOOLCHAIN_FILE=psxrecomp/cmake/toolchain-mingw-w64.cmake"]
+    if s.renderer == "vulkan":
+        # Never ship a fake Vulkan: without the SDK the framework
+        # silently builds a stub, so refuse up front with the fix.
+        headers, glslc = vulkan_sdk_status()
+        if not headers or not glslc:
+            raise StageError(
+                "Vulkan renderer selected but the Vulkan SDK is not "
+                "installed on this machine (need Vulkan headers + "
+                "glslc). Install with: sudo apt install -y "
+                "libvulkan-dev glslang-tools — or choose OpenGL or "
+                "Software. (The build refuses to ship a stub that only "
+                "pretends to be Vulkan.)")
+        extra.append("-DPSX_ENABLE_VULKAN=ON")
+        r.log(f"Vulkan SDK found: headers {headers}, glslc {glslc}")
     r.run_ok(["cmake", "-S", repo, "-B", bdir, "-G", "Ninja",
               "-DCMAKE_BUILD_TYPE=Release",
               f"-DPSX_RECOMP_UI={'ON' if s.launcher_ui else 'OFF'}",
@@ -601,12 +641,22 @@ def stage_build(r, job, target):
     exe = bdir / (job.name if target == "linux" else job.name + ".exe")
     if not exe.exists() or exe.stat().st_size == 0:
         raise StageError(f"{target} build finished but {exe} is missing/empty")
+    if s.renderer == "vulkan":
+        # The real backend embeds SPIR-V shaders into vk_shaders_spv.h;
+        # the stub build never generates it. Its absence = fake Vulkan.
+        if not list(bdir.rglob("vk_shaders_spv.h")):
+            raise StageError(
+                f"{target} build claimed Vulkan but vk_shaders_spv.h "
+                "was not generated — the inert stub was built instead. "
+                "Check the Vulkan SDK installation.")
+        r.log(f"Vulkan backend verified in {target} build "
+              "(vk_shaders_spv.h present)")
     r.log(f"{target} binary: {exe} ({exe.stat().st_size} bytes)")
 
 
 def stage_verify(r, job):
     repo = job.repo
-    probe = job.probes[-1]
+    probe = job.probes[0]
     entry = ("func_" + probe["entry_pc"].replace("0x", "")).lower()
     checks = []
     if job.settings.build_linux:
@@ -628,7 +678,7 @@ def stage_verify(r, job):
 # ---------------------------------------------------------------- packaging
 
 def package_game_toml(job):
-    probe = job.probes[-1]
+    probe = job.probes[0]
     s = job.settings
     players = s.players or 1
     lines = [
@@ -676,7 +726,7 @@ def package_game_toml(job):
 
 
 def package_readme(job):
-    probe = job.probes[-1]
+    probe = job.probes[0]
     s = job.settings
     multi = ""
     if probe.get("track_count", 1) > 1:
@@ -750,6 +800,24 @@ Matthew Stanley (mstan), now part of the RetroPortingToolkit
 """
 
 
+def _job_artwork(r, job):
+    """Cover art to bundle into packages: the GUI-fetched file when the
+    job carries one, else fetch by serial into the app art cache (CLI
+    parity). Returns a Path or None."""
+    if job.art and Path(job.art).exists():
+        return Path(job.art)
+    serial = job.probes[0].get("serial") if job.probes else ""
+    if serial and job.cues:
+        try:
+            cache = Path(__file__).resolve().parent.parent / "art-cache"
+            got = fetch_cover(job.cues[0], cache, serial)
+            if got:
+                return Path(got)
+        except Exception as e:
+            r.log(f"cover art fetch skipped: {e}")
+    return None
+
+
 def stage_package(r, job):
     repo, s = job.repo, job.settings
     name = job.name
@@ -770,6 +838,19 @@ def stage_package(r, job):
         (stage / "README.md").write_text(package_readme(job))
         shutil.copytree(bdir / "bios", stage / "bios")
         shutil.copytree(bdir / "assets", stage / "assets")
+        # The game launcher shows cover art from artwork/<serial>/
+        # next to the exe (recomp-ui launcher_artwork.h; "front" ranks
+        # first). One folder per disc serial in the set.
+        art_src = _job_artwork(r, job)
+        if art_src:
+            for p in job.probes:
+                serial = p.get("serial")
+                if serial:
+                    adir = stage / "artwork" / serial
+                    adir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(art_src,
+                                 adir / f"front{art_src.suffix.lower()}")
+            r.log(f"bundled cover art: {art_src.name}")
         shutil.copytree(bdir / "mods", stage / "mods")
         st = stage / "mods" / "state.toml"
         if st.exists():
@@ -842,7 +923,7 @@ def job_from_dict(d):
     s = JobSettings(**d.get("settings", {}))
     return Job(cues=d["cues"], name=d["name"], title=d["title"],
                work_dir=d["work_dir"], settings=s,
-               slug_override=d.get("slug", ""))
+               slug_override=d.get("slug", ""), art=d.get("art", ""))
 
 
 def main(argv=None):
@@ -860,6 +941,9 @@ def main(argv=None):
 
     if a.cmd == "toolbox":
         print(json.dumps(toolbox_check(), indent=2))
+        headers, glslc = vulkan_sdk_status()
+        print(f"vulkan sdk (only needed for Vulkan builds): "
+              f"headers={headers} glslc={glslc}")
         return 0
     if a.cmd == "probe":
         template = find_template(a.template)
