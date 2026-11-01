@@ -348,8 +348,14 @@ def stage_probe(r, job, template):
         json_paths.append(jp)
     if len(job.cues) > 1:
         job.set_verdict = check_disc_set(r, json_paths, template)
-        same = job.set_verdict.get("same_program") or \
-            job.set_verdict.get("verdict") == "same_program" or \
+        # verify_disc_set.py's real schema: verdict is "data-only" when
+        # every disc boots ONE identical program (the buildable case),
+        # "n-programs" when they differ. (An earlier gate listened for a
+        # "same_program" string the tool never emits and failed every
+        # legitimate multi-disc set — caught on Driver 2, 2026-11-01.)
+        same = (job.set_verdict.get("verdict") in ("data-only", "same_program")
+                and not job.set_verdict.get("differing_program_fields")) or \
+            job.set_verdict.get("same_program") or \
             job.set_verdict.get("buildable") is True
         if not same:
             raise StageError(
