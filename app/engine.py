@@ -739,6 +739,12 @@ def package_game_toml(job):
         "",
         "[video]",
         f'renderer = "{s.renderer}"',
+        # The launcher only OFFERS Vulkan when the game opts in via
+        # offer_vulkan (runtime main.cpp: "settings requested Vulkan,
+        # but this game does not offer Vulkan in the launcher; using
+        # OpenGL"). Without this line a Vulkan build silently runs
+        # OpenGL - caught on the Tekken 3 test build, 2026-11-01.
+        *( ['offer_vulkan = true'] if s.renderer == "vulkan" else [] ),
         f'aspect_ratio = "{s.aspect_ratio}"',
         "",
         "[controller]",
