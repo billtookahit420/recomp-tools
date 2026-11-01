@@ -677,6 +677,18 @@ def stage_verify(r, job):
 
 # ---------------------------------------------------------------- packaging
 
+def disc_id(probe):
+    """Identity for a disc in the packaged game.toml. Retail discs
+    carry a serial; prototypes like Resident Evil 1.5 (MZD) have an
+    EMPTY serial, and shipping id = "" would leave the launcher
+    roster keyed on nothing. Fall back to the volume id, then the
+    boot EXE stem."""
+    for v in (probe.get("serial"), probe.get("volume_id")):
+        if v:
+            return v
+    return Path(probe.get("boot_exe", "UNKNOWN")).stem or "UNKNOWN"
+
+
 def package_game_toml(job):
     probe = job.probes[0]
     s = job.settings
@@ -689,7 +701,7 @@ def package_game_toml(job):
         "",
         "[game]",
         f'name = "{job.title}"',
-        f'id = "{probe["serial"]}"',
+        f'id = "{disc_id(probe)}"',
         f"players = {players}",
         f'exe = "disc/{probe["boot_exe"]}"',
         f'load_address = "{probe["load_address"]}"',
@@ -699,7 +711,7 @@ def package_game_toml(job):
     ]
     if len(job.cues) > 1:
         discs = ",\n    ".join(f'"{Path(c).name}"' for c in job.cues)
-        serials = ",\n    ".join(f'"{p["serial"]}"' for p in job.probes)
+        serials = ",\n    ".join(f'"{disc_id(p)}"' for p in job.probes)
         lines += [f"discs = [\n    {discs},\n]",
                   f"disc_serials = [\n    {serials},\n]"]
     lines += [
@@ -761,7 +773,7 @@ def package_readme(job):
               "file or rebind the keys in the launcher to use save states.\n")
     return f"""# {job.title} - Recompiled for PC
 
-{job.title} (PS1, {probe['serial']}), recompiled to native PC.
+{job.title} (PS1, {disc_id(probe)}), recompiled to native PC.
 {job.settings.players or 1} player(s). No disc is included - use your own
 legally dumped disc image.
 {multi}
