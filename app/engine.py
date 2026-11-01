@@ -212,7 +212,90 @@ class Job:
 
 # ---------------------------------------------------------------- probing
 
+def patch_probe_subdir_boot(template, log=print):
+    """Teach the framework probe to follow SYSTEM.CNF boot paths that
+    point INTO a subdirectory (Tekken 3: BOOT = cdrom:\\TEKKEN3\\SLUS_004.02;1
+    — the stock probe only searches the root directory and fails those
+    discs with 'boot EXE not on disc'). Idempotent text patch, applied
+    to the template / framework cache and to scaffolded projects."""
+    try:
+        probe = Path(template) / "psxrecomp" / "tools" / \
+            "new_project_layout" / "probe_disc.py"
+        if not probe.exists():
+            return
+        text = probe.read_text()
+        if "boot_path_components" in text:
+            return
+        helper = '''
+
+def boot_path_components(cnf: bytes) -> list[str]:
+    """SYSTEM.CNF BOOT path split into components, e.g.
+    cdrom:\\TEKKEN3\\SLUS_004.02;1 -> ["TEKKEN3", "SLUS_004.02"]."""
+    for line in cnf.decode("ascii", "replace").splitlines():
+        if line.strip().upper().startswith("BOOT"):
+            rhs = line.split("=", 1)[1].strip().split(";")[0].strip()
+            if rhs.lower().startswith("cdrom:"):
+                rhs = rhs[6:]
+            parts = [p for p in re.split(r"[\\\\/]+", rhs.strip("\\\\/ ")) if p]
+            return [p.upper() for p in parts]
+    return []
+
+'''
+        anchor = "\ndef normalize_serial("
+        if anchor not in text:
+            return
+        text = text.replace(anchor, helper + "def normalize_serial(", 1)
+        old_raise = """            else:
+                raise SystemExit(
+                    f"boot EXE {boot_token!r} not on disc "
+                    f"(found {sorted(entries)[:24]})"
+                )
+"""
+        new_raise = """            else:
+                # Subdirectory boot: walk the BOOT path's directories
+                # and register the EXE under its basename so the
+                # reads below work unchanged.
+                parts = boot_path_components(cnf)
+                resolved = None
+                if len(parts) > 1:
+                    cur = entries
+                    ok = True
+                    for comp in parts[:-1]:
+                        hit = next((k for k in cur if k.upper() == comp),
+                                   None)
+                        if hit is None:
+                            ok = False
+                            break
+                        dext, dsize = cur[hit]
+                        dbytes = b"".join(
+                            read_user(data, dext + i)
+                            for i in range((dsize + USER - 1) // USER))
+                        cur = parse_root_entries(dbytes[:dsize])
+                    if ok:
+                        hit = next((k for k in cur
+                                    if k.upper() == parts[-1]), None)
+                        if hit is not None:
+                            resolved = cur[hit]
+                if resolved is not None:
+                    entries[disc_boot] = resolved
+                else:
+                    raise SystemExit(
+                        f"boot EXE {boot_token!r} not on disc "
+                        f"(found {sorted(entries)[:24]})"
+                    )
+"""
+        if old_raise not in text:
+            return
+        text = text.replace(old_raise, new_raise, 1)
+        probe.write_text(text)
+        log("patched probe_disc.py: subdirectory boot paths (Tekken 3)")
+    except Exception as e:  # a patch failure must never break a run
+        log(f"probe subdir patch skipped: {e}")
+
+
 def probe_cue(runner, cue, template, players=1, json_out=None):
+    patch_probe_subdir_boot(template,
+                            getattr(runner, "log", print))
     probe = template / "psxrecomp" / "tools" / "new_project_layout" / "probe_disc.py"
     out = json_out or (Path(cue).parent / (Path(cue).stem + ".probe.json"))
     runner.run_ok(["python3", probe, "--json-out", out, "--players", players, cue],
@@ -482,7 +565,12 @@ def stage_emitters(r, job):
 
 def stage_generate(r, job):
     repo = job.repo
-    cue = job.cues[-1]           # build disc = last of a verified set
+    # Generate against the FIRST cue: the scaffold writes game.toml's
+    # [prepare_disc] known digests from the first cue, and generate's
+    # disc check rejects any other disc of the set (Driver 2, 2026-11-01).
+    # For a verified one-program set the boot EXE is identical on every
+    # disc, so the generated code is the same either way.
+    cue = job.cues[0]
     r.run_ok(["python3", repo / "psxrecomp" / "psxrecomp_cli.py", "generate",
               "--config", "game.toml", "--project-root", ".",
               "--disc", cue, "--no-toolchain-download"],
@@ -723,13 +811,15 @@ def run_job(job, log, stop_after=None):
                          "download failed (check your connection and "
                          "that git is installed)")
     log(f"template project: {template}")
+    patch_probe_subdir_boot(template, log)
     plan = []
     if job.settings.build_linux:
         plan.append("linux")
     if job.settings.build_windows:
         plan.append("windows")
     steps = [
-        ("scaffold", lambda: stage_scaffold(r, job, template)),
+        ("scaffold", lambda: (stage_scaffold(r, job, template),
+                              patch_probe_subdir_boot(job.repo, log))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
         ("ra", lambda: stage_ra(r, job)),
