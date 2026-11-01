@@ -198,7 +198,9 @@ class ProbeWorker(QThread):
             verdict = {}
             if len(self.cues) > 1:
                 verdict = engine.check_disc_set(r, paths, self.template)
-            art = engine.fetch_cover(self.cues[0], ART_CACHE)
+            art = engine.fetch_cover(
+                self.cues[0], ART_CACHE,
+                serial=(probes[0].get("serial", "") if probes else ""))
             self.probed.emit(self.row, {"probes": probes, "verdict": verdict,
                                         "art": str(art) if art else ""})
         except Exception:
