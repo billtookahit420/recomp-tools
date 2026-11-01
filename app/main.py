@@ -99,7 +99,10 @@ missing system packages can be installed with one password prompt:
   pkexec apt install -y build-essential cmake ninja-build zip binutils \
       gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 libgl-dev libssl-dev
 Re-check after installing. The RetroAchievements module is bundled
-with the app; the framework comes from your template project.
+with the app. The PSXRecomp framework is downloaded automatically
+on first use into the app's framework-cache folder (needs git and
+a connection, one time only); if you already keep finished recomp
+projects around, one of those can serve as the template instead.
 
 TROUBLESHOOTING
 - Generate gets killed / runs out of memory: close other apps, lower
@@ -169,6 +172,16 @@ class ProbeWorker(QThread):
     def run(self):
         r = engine.Runner(self.log_line.emit)
         try:
+            if self.template is None:
+                self.log_line.emit("no template project - downloading "
+                                   "the framework (one-time)...")
+                self.template = engine.ensure_framework_cache(
+                    self.log_line.emit)
+            if self.template is None:
+                self.log_line.emit("FAILED: framework download failed "
+                                   "(needs git + a connection)")
+                self.probed.emit(self.row, {})
+                return
             probes = []
             paths = []
             tmp = Path(self.cues[0]).parent
@@ -364,7 +377,7 @@ class MainWindow(QMainWindow):
         bits = []
         bits.append("Toolbox OK" if not missing
                     else "Missing: " + ", ".join(missing))
-        bits.append(f"template: {tmpl.name if tmpl else 'NONE FOUND'}")
+        bits.append(f"template: {tmpl.name if tmpl else 'downloads on first use'}")
         self.toolbox_label.setText(" | ".join(bits))
 
     def current_settings(self):
@@ -456,9 +469,6 @@ class MainWindow(QMainWindow):
             return
         row = rows.pop()
         template = engine.find_template(self.tpl_edit.text().strip())
-        if template is None:
-            QMessageBox.warning(self, "Probe", "No template project found.")
-            return
         self._fill_row(row, self.items[row], "probing")
         self.probe_worker = ProbeWorker(row, self.items[row]["cues"],
                                         template, self.players_spin.value() or 1)
