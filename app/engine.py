@@ -55,11 +55,53 @@ def toolbox_check():
     return {t: shutil.which(t) for t in TOOLS}
 
 
+FRAMEWORK_URLS = {
+    "psxrecomp": "https://github.com/mstan/psxrecomp.git",
+    "recomp-ui": "https://github.com/RetroPortingToolKit/recomp-ui.git",
+}
+
+
+def framework_cache():
+    """App-managed framework download, used on machines with no finished
+    recomp project to borrow tools from (a fresh install)."""
+    return Path(__file__).resolve().parent.parent / "framework-cache"
+
+
+def _cache_ok(p):
+    return ((p / "psxrecomp" / "tools" / "new_project_layout").is_dir()
+            and (p / "recomp-ui").is_dir())
+
+
+def ensure_framework_cache(log):
+    """Download the framework once into framework-cache/ and return it
+    as a template. Returns None when git is missing or a clone fails."""
+    cache = framework_cache()
+    if _cache_ok(cache):
+        return cache
+    if not shutil.which("git"):
+        log("framework download needs git, which is not installed")
+        return None
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, url in FRAMEWORK_URLS.items():
+        dst = cache / name
+        if dst.is_dir() and any(dst.iterdir()):
+            continue
+        log(f"downloading framework: {url}")
+        res = subprocess.run(["git", "clone", "--depth", "1", url,
+                              str(dst)], capture_output=True, text=True)
+        if res.returncode != 0:
+            log("clone failed: " + (res.stderr or "")[-300:])
+            return None
+    return cache if _cache_ok(cache) else None
+
+
 def find_template(override=""):
     """A template project is any finished recomp whose psxrecomp/ tree we
     can copy when the framework clone fails (it hangs often)."""
     if override and (Path(override) / "psxrecomp").is_dir():
         return Path(override)
+    if _cache_ok(framework_cache()):
+        return framework_cache()
     ws = Path.home() / "workspace"
     cands = []
     for d in sorted((p for p in ws.glob("*-recomp/*") if p.is_dir()),
@@ -623,8 +665,13 @@ def run_job(job, log, stop_after=None):
     r = Runner(log)
     template = find_template(job.settings.template_dir)
     if template is None:
-        raise StageError("no template project found (need a finished "
-                         "recomp with psxrecomp/ to copy the framework from)")
+        log("no template project - downloading the framework "
+            "(one-time, needs git + a connection)")
+        template = ensure_framework_cache(log)
+    if template is None:
+        raise StageError("no template project found and the framework "
+                         "download failed (check your connection and "
+                         "that git is installed)")
     log(f"template project: {template}")
     plan = []
     if job.settings.build_linux:
