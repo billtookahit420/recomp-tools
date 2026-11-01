@@ -232,26 +232,68 @@ def check_disc_set(runner, probe_json_paths, template):
     return verdict
 
 
-def fetch_cover(cue, dest_dir):
-    """Fetch libretro-thumbnails Named_Boxarts art for the cue's Redump
-    name. Returns the PNG path or None."""
-    name = Path(cue).stem
-    for ch in '&*/:<>?\\|"':
-        name = name.replace(ch, "_")
-    url = ("https://thumbnails.libretro.com/Sony%20-%20PlayStation/"
-           f"Named_Boxarts/{urllib.parse.quote(name)}.png")
-    dest = Path(dest_dir) / (Path(cue).stem + ".png")
+REDUMP_DAT_URL = ("https://raw.githubusercontent.com/libretro/"
+                  "libretro-database/master/metadat/redump/"
+                  "Sony%20-%20PlayStation.dat")
+
+
+def redump_name_for_serial(serial, cache_dir):
+    """Look a game's Redump name up by its disc serial (SLUS-00331 ->
+    'Final Doom (USA)') in libretro-database's Redump DAT, downloaded
+    once and cached. Returns None when the serial is unknown (homebrew,
+    prototypes, unlisted revisions)."""
+    if not serial:
+        return None
+    dat = Path(cache_dir) / "redump-psx.dat"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "RecompTools/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = r.read()
-        if len(data) < 1000:
-            return None
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-        return dest
+        if not dat.exists() or dat.stat().st_size < 100000:
+            req = urllib.request.Request(
+                REDUMP_DAT_URL, headers={"User-Agent": "RecompTools/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = r.read()
+            dat.parent.mkdir(parents=True, exist_ok=True)
+            dat.write_bytes(data)
+        text = dat.read_text(errors="replace")
     except Exception:
         return None
+    for block in text.split("\ngame ("):
+        if f'\tserial "{serial}"' in block:
+            m = re.search(r'\tname "([^"]+)"', block)
+            if m:
+                return m.group(1)
+    return None
+
+
+def fetch_cover(cue, dest_dir, serial=""):
+    """Fetch libretro-thumbnails Named_Boxarts art. Prefer the game's
+    Redump name resolved from its disc serial (the probe reads the
+    serial off the disc, so the cue's filename does not matter); fall
+    back to the cue filename. Returns the PNG path or None."""
+    names = []
+    by_serial = redump_name_for_serial(serial, dest_dir)
+    if by_serial:
+        names.append(by_serial)
+    names.append(Path(cue).stem)
+    dest = Path(dest_dir) / (Path(cue).stem + ".png")
+    for nm in names:
+        name = nm
+        for ch in '&*/:<>?\\|"':
+            name = name.replace(ch, "_")
+        url = ("https://thumbnails.libretro.com/Sony%20-%20PlayStation/"
+               f"Named_Boxarts/{urllib.parse.quote(name)}.png")
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "RecompTools/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            if len(data) < 1000:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            return dest
+        except Exception:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------- stages
