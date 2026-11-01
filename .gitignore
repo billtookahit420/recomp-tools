@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+settings.json
+job-*.json
+art-cache/
+shots-*.png
+logs-*.log
+*.zip

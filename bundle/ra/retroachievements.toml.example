@@ -1,0 +1,20 @@
+# RetroAchievements login for the Tekken 3 recomp.
+#
+# HOW TO ENABLE:
+#  1. Copy this file to "retroachievements.toml" (same folder as Tekken_3).
+#  2. Get your API token: log in at retroachievements.org, go to
+#     Settings -> API Token, and copy it. (Use the token, NEVER your
+#     password. The token can be revoked anytime from the same page.)
+#  3. Fill in your username and token below, save, and restart the game.
+#  4. Achievements unlock in-game and on your RetroAchievements profile.
+#
+# If this file is absent (or username/token are blank), RetroAchievements
+# simply stays off and the game runs normally.
+#
+# hardcore: false = normal mode (memory-card saves and normal play work).
+#          true  = hardcore mode (RA rules: no cheats/savestates; the game
+#                  may reset when toggled). Default is false.
+
+username = "YOUR_USERNAME"
+api_token = "YOUR_API_TOKEN"
+hardcore = false
