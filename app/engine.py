@@ -316,6 +316,23 @@ def check_disc_set(runner, probe_json_paths, template):
     return verdict
 
 
+def classify_set(verdict):
+    """Route a disc-set verdict: "same" (every disc boots ONE
+    identical program -> one build, one package), "split" (the discs
+    provably boot DIFFERENT programs -> one build per disc), or
+    "review" (anything unclear -> never guessed). verify_disc_set.py
+    emits verdict "data-only" for the one-program case and
+    "n-programs" when the program fields differ."""
+    v = verdict.get("verdict")
+    differing = verdict.get("differing_program_fields")
+    if (v in ("data-only", "same_program") and not differing) or \
+            verdict.get("same_program") or verdict.get("buildable") is True:
+        return "same"
+    if v == "n-programs" and differing:
+        return "split"
+    return "review"
+
+
 REDUMP_DAT_URL = ("https://raw.githubusercontent.com/libretro/"
                   "libretro-database/master/metadat/redump/"
                   "Sony%20-%20PlayStation.dat")
@@ -432,16 +449,10 @@ def stage_probe(r, job, template):
         json_paths.append(jp)
     if len(job.cues) > 1:
         job.set_verdict = check_disc_set(r, json_paths, template)
-        # verify_disc_set.py's real schema: verdict is "data-only" when
-        # every disc boots ONE identical program (the buildable case),
-        # "n-programs" when they differ. (An earlier gate listened for a
-        # "same_program" string the tool never emits and failed every
-        # legitimate multi-disc set — caught on Driver 2, 2026-11-01.)
-        same = (job.set_verdict.get("verdict") in ("data-only", "same_program")
-                and not job.set_verdict.get("differing_program_fields")) or \
-            job.set_verdict.get("same_program") or \
-            job.set_verdict.get("buildable") is True
-        if not same:
+        # run_job's pre-pass routes different-program sets to per-disc
+        # builds before this stage ever runs, so anything reaching
+        # here that is not one program is a genuine surprise.
+        if classify_set(job.set_verdict) != "same":
             raise StageError(
                 "multi-disc set is NOT one program - needs review "
                 f"(verdict: {json.dumps(job.set_verdict)[:300]})")
@@ -905,6 +916,38 @@ def run_job(job, log, stop_after=None):
                          "that git is installed)")
     log(f"template project: {template}")
     patch_probe_subdir_boot(template, log)
+    if len(job.cues) > 1:
+        # Disc-set routing BEFORE any building: probe every disc and
+        # check the set. One program -> fall through and build ONE
+        # package. Different programs -> one full build per disc
+        # (Resident Evil 2 pattern). Unclear -> needs review.
+        tmp = Path(job.cues[0]).parent
+        paths = []
+        for i, cue in enumerate(job.cues):
+            jp = tmp / f".recomp-tools-setcheck-{i}.json"
+            probe_cue(r, cue, template, job.settings.players or 1,
+                      json_out=jp)
+            paths.append(jp)
+        verdict = check_disc_set(r, paths, template)
+        job.set_verdict = verdict
+        route = classify_set(verdict)
+        if route == "review":
+            raise StageError(
+                "multi-disc set could not be classified - needs review "
+                f"(verdict: {json.dumps(verdict)[:300]})")
+        if route == "split":
+            log("disc set: the discs boot DIFFERENT programs - "
+                "converting each disc as its own game")
+            for i, cue in enumerate(job.cues):
+                sub = Job(cues=[cue],
+                          name=f"{job.name}Disc{i + 1}",
+                          title=f"{job.title} (Disc {i + 1})",
+                          work_dir=job.work_dir, settings=job.settings)
+                log(f"=== disc {i + 1} of {len(job.cues)}: "
+                    f"{sub.title} ===")
+                run_job(sub, log)
+            return "done"
+        log("disc set verified: one program, one build")
     plan = []
     if job.settings.build_linux:
         plan.append("linux")
