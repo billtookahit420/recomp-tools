@@ -352,9 +352,15 @@ def stage_ra(r, job):
         if not ok:
             raise StageError("could not add accessor declaration to mod_runtime.h")
     if "mod_runtime_disc_path" not in cpp.read_text():
-        with cpp.open("a") as f:
-            f.write("\nconst std::filesystem::path& mod_runtime_disc_path() {\n"
-                    "    return state().disc_path;\n}\n")
+        # Insert right after the effective_disc_path definition: newer
+        # framework revisions keep state() inside a namespace that is
+        # closed by end-of-file, so appending at EOF does not compile.
+        ok = _patch_first(cpp, [(
+            r'(const std::filesystem::path& mod_runtime_effective_disc_path\(\) \{\n.*?\n\}\n)',
+            r'\1\nconst std::filesystem::path& mod_runtime_disc_path() {\n'
+            r'    return state().disc_path;\n}\n')])
+        if not ok:
+            raise StageError("could not add accessor impl to mod_runtime.cpp")
     r.log("RA accessor present")
     cm = repo / "CMakeLists.txt"
     txt = cm.read_text()
