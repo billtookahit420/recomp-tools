@@ -216,6 +216,7 @@ class MainWindow(QMainWindow):
         self.items = []               # queue model: dicts
         self.worker = None
         self.probe_worker = None
+        self._probe_pending = []      # rows waiting for an auto-probe
         self._build_ui()
         self._load_settings()
         self.refresh_toolbox()
@@ -437,6 +438,7 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self._fill_row(row, item, "queued")
+        self._queue_probe(row)        # auto-probe every added disc/set
 
     def _fill_row(self, row, item, status):
         probe = item["probes"][-1] if item["probes"] else {}
@@ -473,7 +475,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Probe",
                                     "Select exactly one queue item to probe.")
             return
-        row = rows.pop()
+        self._queue_probe(rows.pop(), force=True)
+
+    def _queue_probe(self, row, force=False):
+        """Probe a row now, or after the running probe finishes. Adding
+        a disc auto-probes it; re-adding/probing a probed row needs the
+        manual button (force)."""
+        if not force and self.items[row]["probes"]:
+            return
+        if self.probe_worker is not None and self.probe_worker.isRunning():
+            if row not in self._probe_pending:
+                self._probe_pending.append(row)
+            return
+        self._start_probe(row)
+
+    def _start_probe(self, row):
         template = engine.find_template(self.tpl_edit.text().strip())
         self._fill_row(row, self.items[row], "probing")
         self.probe_worker = ProbeWorker(row, self.items[row]["cues"],
@@ -485,6 +501,7 @@ class MainWindow(QMainWindow):
     def _on_probed(self, row, data):
         if not data:
             self._fill_row(row, self.items[row], "probe failed")
+            self._probe_next()
             return
         item = self.items[row]
         item["probes"] = data["probes"]
@@ -495,6 +512,14 @@ class MainWindow(QMainWindow):
                 item["probes"][0].get("display_name") or item["title"])
         self._fill_row(row, item, "probed")
         self.show_selected()
+        self._probe_next()
+
+    def _probe_next(self):
+        while self._probe_pending:
+            row = self._probe_pending.pop(0)
+            if 0 <= row < len(self.items):
+                self._start_probe(row)
+                return
 
     def show_selected(self):
         rows = {i.row() for i in self.table.selectedIndexes()}
