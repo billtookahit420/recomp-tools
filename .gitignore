@@ -1,4 +1,5 @@
 .venv/
+framework-cache/
 __pycache__/
 *.pyc
 settings.json
