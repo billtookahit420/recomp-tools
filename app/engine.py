@@ -450,7 +450,9 @@ def stage_build(r, job, target):
     repo = job.repo
     s = job.settings
     if target == "linux":
-        bdir, extra = repo / "build-release", []
+        # SDL_X11_XTEST is only SDL's test-automation hook; requiring
+        # libxtst-dev makes stock desktops fail configure for nothing.
+        bdir, extra = repo / "build-release", ["-DSDL_X11_XTEST=OFF"]
     else:
         bdir = repo / "build-windows"
         extra = ["-DCMAKE_TOOLCHAIN_FILE=psxrecomp/cmake/toolchain-mingw-w64.cmake"]
