@@ -73,6 +73,15 @@ offers disc selection. If the discs boot DIFFERENT programs
 automatically. Only a set that cannot be classified either way is
 parked as "needs review", never guessed.
 
+CHANGING DISCS MID-GAME
+Packages built from a disc set support swapping while the game runs
+(the package README says the same): when the game asks for another
+disc, open the in-game menu with F10 (or Ctrl+L) on the keyboard, or
+Select/Back + L3 together on the controller, go to the Disc section,
+set "Selected disc", then "Insert disc and resume". This works in
+builds made with this version or later - older packages had a bug
+where the menu opened invisibly; re-run those games here to fix them.
+
 OPTIONS
 - Players override: 0 = trust the probe/setup default. The main menu
   of the game is the ground truth; when in doubt leave 0.
