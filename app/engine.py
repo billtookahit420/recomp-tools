@@ -55,6 +55,31 @@ def toolbox_check():
     return {t: shutil.which(t) for t in TOOLS}
 
 
+# System packages the Linux first-run setup installs, in one pkexec
+# password prompt. Single source of truth: the Help tab describes this
+# list and the toolbox Install button runs it. libvulkan-dev + glslc
+# are the Vulkan SDK pieces the framework needs at build time to
+# compile the REAL Vulkan renderer (glslang-tools alone does NOT
+# provide glslc - learned on the build VM, 2026-11-01).
+LINUX_SYSTEM_PACKAGES = [
+    "build-essential", "cmake", "ninja-build", "zip", "binutils",
+    "gcc-mingw-w64-x86-64", "g++-mingw-w64-x86-64", "libgl-dev",
+    "libssl-dev", "git", "python3-venv", "libfreetype-dev",
+    "libharfbuzz-dev", "libxtst-dev", "libasound2-dev",
+    "libpulse-dev", "libudev-dev", "libxext-dev", "libxrandr-dev",
+    "libxcursor-dev", "libxi-dev", "libxss-dev", "libxkbcommon-dev",
+    "libdrm-dev", "libgbm-dev", "libegl-dev", "libdbus-1-dev",
+    "libvulkan-dev", "glslang-tools", "glslc",
+]
+
+
+def system_install_command():
+    """One pkexec prompt installs every system package (Linux)."""
+    pkgs = " ".join(LINUX_SYSTEM_PACKAGES)
+    return ["pkexec", "sh", "-c",
+            f"apt-get update -qq && apt-get install -y {pkgs}"]
+
+
 FRAMEWORK_URLS = {
     "psxrecomp": "https://github.com/mstan/psxrecomp.git",
     "recomp-ui": "https://github.com/RetroPortingToolKit/recomp-ui.git",
@@ -202,6 +227,11 @@ class Job:
     art: str = ""                    # cover art file to bundle (GUI-fetched)
     probes: list = field(default_factory=list)   # probe JSON dicts, per cue
     set_verdict: dict = field(default_factory=dict)
+    vulkan_backend: dict = field(default_factory=dict)
+    # target ("linux"/"windows") -> True when that target's build tree
+    # proved a real Vulkan backend (vk_shaders_spv.h). Filled by
+    # stage_build, read by stage_package: the package offers Vulkan
+    # for exactly the targets that truly contain it.
 
     @property
     def slug(self):
@@ -644,31 +674,59 @@ def stage_build(r, job, target):
             raise StageError(
                 "Vulkan renderer selected but the Vulkan SDK is not "
                 "installed on this machine (need Vulkan headers + "
-                "glslc). Install with: sudo apt install -y "
-                "libvulkan-dev glslang-tools — or choose OpenGL or "
+                "glslc). Install with the toolbox Install button, or: "
+                "sudo apt install -y libvulkan-dev glslc — or choose "
+                "OpenGL or "
                 "Software. (The build refuses to ship a stub that only "
                 "pretends to be Vulkan.)")
         extra.append("-DPSX_ENABLE_VULKAN=ON")
         r.log(f"Vulkan SDK found: headers {headers}, glslc {glslc}")
+    env = None
+    if target != "linux" and not os.environ.get("VULKAN_SDK"):
+        # Cross-builds (MinGW) cannot find_path the host's Vulkan
+        # headers, so their Vulkan backend silently builds as the
+        # stub even on SDK machines. Point VULKAN_SDK at a small
+        # shim inside the project that symlinks the host's headers
+        # and glslc into the SDK layout the framework checks first.
+        headers, glslc_path = vulkan_sdk_status()
+        if headers and glslc_path:
+            shim = repo / ".vulkan-sdk-shim"
+            (shim / "bin").mkdir(parents=True, exist_ok=True)
+            inc_link = shim / "include"
+            if not inc_link.exists():
+                inc_link.symlink_to(headers, target_is_directory=True)
+            glslc_link = shim / "bin" / "glslc"
+            if not glslc_link.exists():
+                glslc_link.symlink_to(glslc_path)
+            env = {"VULKAN_SDK": str(shim)}
+            r.log("Cross-build: VULKAN_SDK pointed at a host shim "
+                  "so the Windows build finds the Vulkan SDK too")
     r.run_ok(["cmake", "-S", repo, "-B", bdir, "-G", "Ninja",
               "-DCMAKE_BUILD_TYPE=Release",
               f"-DPSX_RECOMP_UI={'ON' if s.launcher_ui else 'OFF'}",
-              *extra], timeout=900)
+              *extra], timeout=900, env=env)
     r.run_ok(["cmake", "--build", bdir, "--target", "psx-runtime",
-              "-j", s.jobs], timeout=7200)
+              "-j", s.jobs], timeout=7200, env=env)
     exe = bdir / (job.name if target == "linux" else job.name + ".exe")
     if not exe.exists() or exe.stat().st_size == 0:
         raise StageError(f"{target} build finished but {exe} is missing/empty")
-    if s.renderer == "vulkan":
-        # The real backend embeds SPIR-V shaders into vk_shaders_spv.h;
-        # the stub build never generates it. Its absence = fake Vulkan.
-        if not list(bdir.rglob("vk_shaders_spv.h")):
-            raise StageError(
-                f"{target} build claimed Vulkan but vk_shaders_spv.h "
-                "was not generated — the inert stub was built instead. "
-                "Check the Vulkan SDK installation.")
-        r.log(f"Vulkan backend verified in {target} build "
-              "(vk_shaders_spv.h present)")
+    # The real backend embeds SPIR-V shaders into vk_shaders_spv.h;
+    # the stub build never generates it. Record the truth per target
+    # for EVERY renderer (not just Vulkan jobs): packaging offers
+    # Vulkan for exactly the targets whose build contains it.
+    vk_real = bool(list(bdir.rglob("vk_shaders_spv.h")))
+    if s.renderer == "vulkan" and not vk_real:
+        raise StageError(
+            f"{target} build claimed Vulkan but vk_shaders_spv.h "
+            "was not generated — the inert stub was built instead. "
+            "Check the Vulkan SDK installation.")
+    job.vulkan_backend[target] = vk_real
+    if vk_real:
+        r.log(f"Vulkan backend in the {target} build "
+              "(vk_shaders_spv.h present) - package will offer Vulkan")
+    elif s.renderer != "vulkan":
+        r.log(f"No Vulkan backend in the {target} build (Vulkan SDK "
+              "not found at build time) - package will not offer it")
     r.log(f"{target} binary: {exe} ({exe.stat().st_size} bytes)")
 
 
@@ -707,7 +765,7 @@ def disc_id(probe):
     return Path(probe.get("boot_exe", "UNKNOWN")).stem or "UNKNOWN"
 
 
-def package_game_toml(job):
+def package_game_toml(job, offer_vulkan=False):
     probe = job.probes[0]
     s = job.settings
     players = s.players or 1
@@ -751,7 +809,15 @@ def package_game_toml(job):
         # but this game does not offer Vulkan in the launcher; using
         # OpenGL"). Without this line a Vulkan build silently runs
         # OpenGL - caught on the Tekken 3 test build, 2026-11-01.
-        *( ['offer_vulkan = true'] if s.renderer == "vulkan" else [] ),
+        # Since v1.0.13 the offer follows the BUILD, not the job's
+        # default renderer: it is written for every target whose
+        # build tree proved a real Vulkan backend (stage_build
+        # records it in job.vulkan_backend), so any package built on
+        # a machine with the Vulkan SDK is switchable between
+        # renderers in the game's launcher. The default renderer
+        # above stays the job's choice (OpenGL unless set otherwise).
+        *( ['offer_vulkan = true']
+           if (offer_vulkan or s.renderer == "vulkan") else [] ),
         f'aspect_ratio = "{s.aspect_ratio}"',
         "",
         "[controller]",
@@ -761,7 +827,7 @@ def package_game_toml(job):
     return "\n".join(lines)
 
 
-def package_readme(job):
+def package_readme(job, offer_vulkan=False):
     probe = job.probes[0]
     s = job.settings
     multi = ""
@@ -795,6 +861,13 @@ def package_readme(job):
         ss = ("\n## Save states\n\nSave-state hotkeys (F7/F8) are unbound in "
               "the included `config.ini` (Recomp Tools setting). Delete that "
               "file or rebind the keys in the launcher to use save states.\n")
+    vk = ""
+    if offer_vulkan and s.renderer != "vulkan":
+        vk = ("\n## Renderer\n\n"
+              "This build also contains the Vulkan renderer: switch "
+              "between OpenGL and Vulkan in the game's launcher "
+              "(Settings). The default is OpenGL. RetroAchievements "
+              "pop-ups draw only under OpenGL.\n")
     return f"""# {job.title} - Recompiled for PC
 
 {job.title} (PS1, {disc_id(probe)}), recompiled to native PC.
@@ -812,7 +885,7 @@ legally dumped disc image.
 
 Keyboard works out of the box. For controllers, connect them BEFORE
 launching, then use the launcher's PLAYER tabs.
-{ra}{ss}
+{ra}{vk}{ss}
 ## BIOS
 
 Uses the built-in OpenBIOS - no BIOS file needed.
@@ -869,9 +942,10 @@ def stage_package(r, job):
             shutil.rmtree(stage.parent)
         stage.mkdir(parents=True)
         shutil.copy2(bdir / exefile, stage / exefile)
-        (stage / "game.toml").write_text(package_game_toml(job))
+        offer = bool(job.vulkan_backend.get(osname))
+        (stage / "game.toml").write_text(package_game_toml(job, offer))
         shutil.copy2(bdir / "game_options.toml", stage / "game_options.toml")
-        (stage / "README.md").write_text(package_readme(job))
+        (stage / "README.md").write_text(package_readme(job, offer))
         shutil.copytree(bdir / "bios", stage / "bios")
         shutil.copytree(bdir / "assets", stage / "assets")
         # The game launcher shows cover art from artwork/<serial>/
