@@ -108,7 +108,11 @@ OPTIONS
   the game to OpenGL in its launcher and pop-ups return.
 - Cover art: the art fetched for the queue is bundled into the
   package under artwork/<serial>/, which is where the game's own
-  launcher looks for it — so covers show in both places.
+  launcher looks for it — so covers show in both places. Fetching
+  tries two hosts for the libretro-thumbnails library and retries
+  each name, so one host having a bad night no longer means a
+  missing cover. The standalone Recomp Covers utility fills covers
+  into packages that were built before this.
 - Build targets: Linux, Windows, or both.
 - Save states: OFF ships a config.ini that unbinds the save-state
   hotkeys (F7/F8). ON ships no config.ini (defaults apply).
