@@ -331,6 +331,40 @@ def boot_path_components(cnf: bytes) -> list[str]:
         log(f"probe subdir patch skipped: {e}")
 
 
+def patch_overlay_draw_chain(template, log=print):
+    """Let the in-game menu and the RetroAchievements pop-ups share the
+    host overlay draw slot. Upstream host_overlay.c keeps ONE draw
+    callback: the menu provider registers at session setup, the RA module
+    registers when it starts and REPLACES it, so the menu opens
+    invisibly (F10 works, nothing paints - field-found on Evil Dead's
+    disc swap, 2026-11-02). This patch keeps up to two callbacks keyed
+    by function pointer, drawn last-registered first so the menu paints
+    on top; a NULL registration still clears all (teardown semantics).
+    Idempotent text patch on the template / framework cache and on
+    scaffolded projects."""
+    try:
+        src = Path(template) / "psxrecomp" / "runtime" / "src" / \
+            "host_overlay.c"
+        if not src.exists():
+            return
+        text = src.read_text()
+        if "PSX_HOST_OVERLAY_DRAW_MAX" in text:
+            return
+        start = "/* ---- P2: overlay draw callback"
+        end = "/* ---- Game HUD layer"
+        if start not in text or end not in text:
+            return
+        i = text.index(start)
+        j = text.index(end)
+        text = text[:i] + OVERLAY_DRAW_CHAIN_SPAN + text[j:]
+        src.write_text(text)
+        log("patched host_overlay.c: menu + RA share the overlay draw")
+    except Exception as e:  # a patch failure must never break a run
+        log(f"overlay draw-chain patch skipped: {e}")
+
+
+OVERLAY_DRAW_CHAIN_SPAN = "/* ---- P2: overlay draw callback -------------------------------------------- */\n/* Registered on the main thread, read on the render / present thread. The\n * function and its context are published together as one immutable record\n * behind an atomic pointer, so a reader never pairs a live function with a\n * stale context.\n *\n * Lifetime: every call runs inside an in-flight count. Replacing or removing\n * the callback swaps the record and then waits until no call that could have\n * read the old record is still running, so when psx_host_overlay_set_draw_cb\n * returns, the previous fn will not run again and its ctx (and the GL objects\n * it draws with) may be freed by the caller. The old record is freed there\n * too. A change made from inside the callback itself does not wait (it would\n * wait for itself); that caller's own frame is the only one still using the\n * old ctx and it returns before the next frame reads the new record. */\n/* Up to two draw consumers share this layer: the in-game menu provider\n * registers first (at session setup) and feature overlays such as the\n * RetroAchievements pop-ups register afterwards. A one-callback record let\n * the later registration silently replace the menu's draw, leaving an open\n * but invisible menu, so the record now keeps both, keyed by function\n * pointer. Entries draw last-registered first, so the first registrant\n * (the menu) paints on top. A NULL fn keeps its historic meaning: the\n * caller is tearing the layer down and every entry is removed. */\n#define PSX_HOST_OVERLAY_DRAW_MAX 2\ntypedef struct {\n    PsxHostOverlayDrawFn fn;\n    void *ctx;\n} PsxHostOverlayDrawEntry;\ntypedef struct {\n    PsxHostOverlayDrawEntry entries[PSX_HOST_OVERLAY_DRAW_MAX];\n    int count;\n} PsxHostOverlayDraw;\n\nstatic _Atomic(PsxHostOverlayDraw *) s_draw = NULL;\nstatic atomic_flag s_draw_set_lock = ATOMIC_FLAG_INIT;\nstatic atomic_int s_draw_inflight = 0;\n#if defined(_MSC_VER)\nstatic __declspec(thread) int s_in_draw = 0;\n#else\nstatic _Thread_local int s_in_draw = 0;\n#endif\n\nstatic void draw_yield(void) {\n#if defined(_WIN32)\n    Sleep(0);\n#else\n    sched_yield();\n#endif\n}\n\nvoid psx_host_overlay_set_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {\n    PsxHostOverlayDraw *rec = NULL, *old;\n    /* Compose the successor from the current record under a lock so two\n     * registering threads cannot lose each other's entry. Readers never\n     * take this lock, so composing cannot deadlock a draw in flight; the\n     * in-flight wait + free below keep the lifetime contract above. */\n    while (atomic_flag_test_and_set(&s_draw_set_lock)) draw_yield();\n    old = atomic_load(&s_draw);\n    if (fn) {\n        int found = -1;\n        rec = (PsxHostOverlayDraw *)malloc(sizeof(*rec));\n        if (!rec) {\n            atomic_flag_clear(&s_draw_set_lock);\n            return;\n        }\n        rec->count = 0;\n        if (old) {\n            for (int i = 0; i < old->count; ++i) {\n                if (old->entries[i].fn == fn) found = rec->count;\n                rec->entries[rec->count++] = old->entries[i];\n            }\n        }\n        if (found >= 0) {\n            rec->entries[found].ctx = ctx; /* re-registering keeps its slot */\n        } else {\n            if (rec->count >= PSX_HOST_OVERLAY_DRAW_MAX)\n                rec->count = PSX_HOST_OVERLAY_DRAW_MAX - 1; /* evict newest other */\n            rec->entries[rec->count].fn = fn;\n            rec->entries[rec->count].ctx = ctx;\n            rec->count++;\n        }\n    }\n    atomic_store(&s_draw, rec); /* seq_cst: ordered with the readers' count */\n    atomic_flag_clear(&s_draw_set_lock);\n    if (s_in_draw) return; /* from inside the callback: see above; old stays (rare) */\n    while (atomic_load(&s_draw_inflight) > 0) draw_yield();\n    free(old);\n}\n\nint psx_host_overlay_has_draw(void) {\n    return atomic_load_explicit(&s_draw, memory_order_acquire) != NULL;\n}\n\nvoid psx_host_overlay_draw(int width, int height) {\n    PsxHostOverlayDraw *rec;\n    if (width <= 0 || height <= 0) return;\n    atomic_fetch_add(&s_draw_inflight, 1); /* seq_cst, before reading the record */\n    rec = atomic_load(&s_draw);\n    if (rec) {\n        s_in_draw = 1;\n        for (int i = rec->count - 1; i >= 0; --i)\n            if (rec->entries[i].fn)\n                rec->entries[i].fn(width, height, rec->entries[i].ctx);\n        s_in_draw = 0;\n    }\n    atomic_fetch_sub(&s_draw_inflight, 1);\n}\n\n"
+
 def probe_cue(runner, cue, template, players=1, json_out=None):
     patch_probe_subdir_boot(template,
                             getattr(runner, "log", print))
@@ -856,6 +890,21 @@ def package_readme(job, offer_vulkan=False):
               + "\nRetroAchievements currently classifies this client as an "
                 "unknown emulator, so unlocks count as Casual (softcore) "
                 "even with hardcore on. Login and achievements work.\n")
+    swap = ""
+    if len(job.cues) > 1:
+        swap = ("\n## Changing discs mid-game\n\n"
+                "This game spans more than one disc, and this build "
+                "supports swapping while the game keeps running:\n\n"
+                "- When the game asks for another disc, open the in-game "
+                "menu: **F10** (or **Ctrl+L**) on the keyboard, or "
+                "**Select/Back + L3** (left stick click) together on the "
+                "controller.\n"
+                "- Go to the **Disc** section, set **Selected disc** to "
+                "the disc the game wants, then choose **Insert disc and "
+                "resume**.\n\n"
+                "Games that only swap at a save point work either way: "
+                "the menu above, or save, quit, and relaunch picking the "
+                "other disc in the launcher.\n")
     ss = ""
     if not s.save_states:
         ss = ("\n## Save states\n\nSave-state hotkeys (F7/F8) are unbound in "
@@ -885,7 +934,7 @@ legally dumped disc image.
 
 Keyboard works out of the box. For controllers, connect them BEFORE
 launching, then use the launcher's PLAYER tabs.
-{ra}{vk}{ss}
+{swap}{ra}{vk}{ss}
 ## BIOS
 
 Uses the built-in OpenBIOS - no BIOS file needed.
@@ -1003,6 +1052,7 @@ def run_job(job, log, stop_after=None):
                          "that git is installed)")
     log(f"template project: {template}")
     patch_probe_subdir_boot(template, log)
+    patch_overlay_draw_chain(template, log)
     if len(job.cues) > 1:
         # Disc-set routing BEFORE any building: probe every disc and
         # check the set. One program -> fall through and build ONE
@@ -1042,7 +1092,8 @@ def run_job(job, log, stop_after=None):
         plan.append("windows")
     steps = [
         ("scaffold", lambda: (stage_scaffold(r, job, template),
-                              patch_probe_subdir_boot(job.repo, log))),
+                              patch_probe_subdir_boot(job.repo, log),
+                              patch_overlay_draw_chain(job.repo, log))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
         ("ra", lambda: stage_ra(r, job)),
