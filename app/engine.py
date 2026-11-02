@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -436,35 +437,70 @@ def redump_name_for_serial(serial, cache_dir):
     return None
 
 
+LIBRETRO_BOXART_HOSTS = (
+    # Same Named_Boxarts data on two hosts: the GitHub mirror first
+    # (the canonical thumbnails host has been seen refusing every
+    # request for hours at a time), then the canonical host itself.
+    "https://raw.githubusercontent.com/libretro-thumbnails/"
+    "Sony_-_PlayStation/master/Named_Boxarts/{}.png",
+    "https://thumbnails.libretro.com/Sony%20-%20PlayStation/"
+    "Named_Boxarts/{}.png",
+)
+
+
+def _fetch_bytes_retry(url, timeout=25, attempts=3):
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "RecompTools/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception:
+            if i + 1 < attempts:
+                time.sleep(2 * (i + 1))
+    return None
+
+
+def _valid_cover(data):
+    if not data or len(data) < 8000:
+        return False
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        if len(data) < 24:
+            return False
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        return w >= 200 and h >= 200
+    return data[:3] == b"\xff\xd8\xff"
+
+
 def fetch_cover(cue, dest_dir, serial=""):
-    """Fetch libretro-thumbnails Named_Boxarts art. Prefer the game's
+    """Fetch Named_Boxarts art from libretro-thumbnails, trying both
+    hosts that serve it and retrying each name. Prefer the game's
     Redump name resolved from its disc serial (the probe reads the
-    serial off the disc, so the cue's filename does not matter); fall
-    back to the cue filename. Returns the PNG path or None."""
+    serial off the disc, so the cue's filename does not matter); try
+    the name without its leading 'ABBR - ' prefix too, then fall back
+    to the cue filename. Returns the PNG path or None."""
     names = []
     by_serial = redump_name_for_serial(serial, dest_dir)
     if by_serial:
         names.append(by_serial)
-    names.append(Path(cue).stem)
-    dest = Path(dest_dir) / (Path(cue).stem + ".png")
-    for nm in names:
-        name = nm
-        for ch in '&*/:<>?\\|"':
-            name = name.replace(ch, "_")
-        url = ("https://thumbnails.libretro.com/Sony%20-%20PlayStation/"
-               f"Named_Boxarts/{urllib.parse.quote(name)}.png")
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "RecompTools/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = r.read()
-            if len(data) < 1000:
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-            return dest
-        except Exception:
-            continue
+        if " - " in by_serial:
+            names.append(by_serial.split(" - ", 1)[1])
+    stem = Path(cue).stem
+    if stem not in names:
+        names.append(stem)
+    dest = Path(dest_dir) / (stem + ".png")
+    for template in LIBRETRO_BOXART_HOSTS:
+        for nm in names:
+            name = nm
+            for ch in '&*/:<>?\\|"':
+                name = name.replace(ch, "_")
+            data = _fetch_bytes_retry(
+                template.format(urllib.parse.quote(name)))
+            if _valid_cover(data):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                return dest
     return None
 
 
