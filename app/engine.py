@@ -156,8 +156,15 @@ def compact_name(title):
 
 
 def cue_title(cue):
-    """'South Park Rally (USA).cue' -> 'South Park Rally'."""
-    stem = Path(cue).stem
+    """'South Park Rally (USA).cue' -> 'South Park Rally'.
+
+    Works on bare folder names too ('Final Fantasy IX (USA) (Disc 1)
+    (v1.1)' -> 'Final Fantasy IX'): Path.stem cannot be used here - it
+    cuts '(v1.1)' at its inner dot, leaving '(v1' glued to the title,
+    which broke set grouping for versioned redump folder names."""
+    stem = Path(cue).name
+    if stem.lower().endswith((".cue", ".bin", ".iso", ".img")):
+        stem = stem.rsplit(".", 1)[0]
     stem = re.sub(r"\s*\((USA|EUR|JPN|Disc \d[^)]*|v[\d.]+|Rev[^)]*)\)", "",
                   stem).strip()
     stem = re.sub(r"\s+", " ", stem)
