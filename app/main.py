@@ -9,6 +9,7 @@ Run:  .venv/bin/python app/main.py
 """
 import json
 import re
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -87,12 +88,15 @@ OPTIONS
 - Renderer default / aspect / controller mode: written into the
   packaged config; changeable later in the launcher.
 - Renderer = Vulkan: builds the real Vulkan backend, which needs
-  the Vulkan SDK on THIS machine at build time (headers + glslc;
-  apt: libvulkan-dev glslang-tools). Without it the build stops
-  with that message rather than shipping the framework's inert
-  stub. Achievement pop-ups draw only under OpenGL — with Vulkan
-  active they're off; players can switch the game to OpenGL in
-  its launcher and pop-ups return.
+  the Vulkan SDK on THIS machine at build time (headers + glslc -
+  the toolbox Install button sets that up). Without it a Vulkan
+  build stops with that message rather than shipping the
+  framework's inert stub. ANY package built with the SDK present
+  also OFFERS Vulkan in the game's own launcher, whatever default
+  is chosen here - players can switch per game; the default stays
+  what was picked here. Achievement pop-ups draw only under
+  OpenGL — with Vulkan active they're off; players can switch
+  the game to OpenGL in its launcher and pop-ups return.
 - Cover art: the art fetched for the queue is bundled into the
   package under artwork/<serial>/, which is where the game's own
   launcher looks for it — so covers show in both places.
@@ -107,13 +111,17 @@ OPTIONS
 FIRST RUN / TOOLBOX
 The header shows the toolbox check. Needed: Python 3, CMake, Ninja, a
 C/C++ compiler, MinGW-w64 for Windows builds, nm, zip. On Linux the
-missing system packages can be installed with one password prompt:
+"Install missing packages" button in the header installs them with
+one password prompt - the Vulkan SDK pieces (libvulkan-dev + glslc)
+are included, so Vulkan builds and the in-launcher Vulkan offer
+work out of the box. The same list by hand:
   pkexec apt install -y build-essential cmake ninja-build zip binutils \
       gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 libgl-dev libssl-dev \
       git python3-venv libfreetype-dev libharfbuzz-dev libxtst-dev \
       libasound2-dev libpulse-dev libudev-dev libxext-dev libxrandr-dev \
       libxcursor-dev libxi-dev libxss-dev libxkbcommon-dev libdrm-dev \
-      libgbm-dev libegl-dev libdbus-1-dev libvulkan-dev glslang-tools
+      libgbm-dev libegl-dev libdbus-1-dev libvulkan-dev glslang-tools \
+      glslc
 Re-check after installing. The RetroAchievements module is bundled
 with the app. The PSXRecomp framework is downloaded automatically
 on first use into the app's framework-cache folder (needs git and
@@ -175,6 +183,27 @@ class Worker(QThread):
                 self.log_line.emit(traceback.format_exc())
                 self.item_status.emit(idx, "failed")
         self.finished_all.emit()
+
+
+class InstallWorker(QThread):
+    """Runs the one-prompt system-package install (Linux, pkexec)."""
+    log_line = Signal(str)
+    done = Signal(bool)
+
+    def run(self):
+        self.log_line.emit(
+            "Installing system packages (one password prompt): "
+            + " ".join(engine.LINUX_SYSTEM_PACKAGES))
+        try:
+            p = subprocess.run(engine.system_install_command(),
+                               capture_output=True, text=True, timeout=1800)
+            for line in (p.stdout + p.stderr).splitlines()[-12:]:
+                self.log_line.emit(line)
+            ok = p.returncode == 0
+        except Exception as ex:
+            self.log_line.emit(f"install failed: {ex}")
+            ok = False
+        self.done.emit(ok)
 
 
 class ProbeWorker(QThread):
@@ -254,6 +283,10 @@ class MainWindow(QMainWindow):
         b = QPushButton("Re-check toolbox")
         b.clicked.connect(self.refresh_toolbox)
         tb.addWidget(b)
+        self.install_btn = QPushButton("Install missing packages")
+        self.install_btn.clicked.connect(self.install_packages)
+        self.install_btn.setEnabled(False)
+        tb.addWidget(self.install_btn)
         v.addLayout(tb)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -404,16 +437,37 @@ class MainWindow(QMainWindow):
         bits.append("Toolbox OK" if not missing
                     else "Missing: " + ", ".join(missing))
         bits.append(f"template: {tmpl.name if tmpl else 'downloads on first use'}")
+        headers, glslc = engine.vulkan_sdk_status()
+        vk_ok = bool(headers and glslc)
+        bits.append("Vulkan SDK OK" if vk_ok else "Vulkan SDK missing")
         self.toolbox_label.setText(" | ".join(bits))
+        if hasattr(self, "install_btn"):
+            self.install_btn.setEnabled(
+                sys.platform.startswith("linux")
+                and (bool(missing) or not vk_ok))
+
+    def install_packages(self):
+        self.install_btn.setEnabled(False)
+        self._install_worker = InstallWorker()
+        self._install_worker.log_line.connect(self.log_line)
+        self._install_worker.done.connect(self._install_done)
+        self._install_worker.start()
+
+    def _install_done(self, ok):
+        self.log_line("System packages installed." if ok
+                      else "Install did not complete - see the log.")
+        self.refresh_toolbox()
 
     def _renderer_hint_update(self, text):
         if text == "vulkan":
             self.renderer_hint.setText(
                 "Vulkan needs the Vulkan SDK (headers + glslc) on this "
-                "machine at build time; without it the build stops "
-                "instead of shipping a fake. RA pop-ups only draw "
-                "under OpenGL: they stay off while Vulkan is the "
-                "active renderer, per the pop-ups option — switch the "
+                "machine at build time — the toolbox Install button "
+                "sets it up; without it the build stops instead of "
+                "shipping a fake. Packages built with the SDK offer "
+                "Vulkan in the game's launcher whatever the default. "
+                "RA pop-ups only draw under OpenGL: they stay off "
+                "while Vulkan is the active renderer — switch the "
                 "game to OpenGL in its launcher and they return.")
         elif text == "software":
             self.renderer_hint.setText(
