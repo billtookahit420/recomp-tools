@@ -73,6 +73,17 @@ offers disc selection. If the discs boot DIFFERENT programs
 automatically. Only a set that cannot be classified either way is
 parked as "needs review", never guessed.
 
+GAMES THAT HUNG AT LEVEL LOAD (FIXED IN v1.0.16)
+Some games with CD music tracks (Tomb Raider 1 + 2 are the known
+cases) reached their title screen fine, then hung on a black screen
+with no audio the moment a level tried to load. The framework's CD
+position answer (GetlocP) always claimed "track 1", so a game
+checking that its seek landed in the level's music track waited
+forever for a confirmation that could never come. Builds made with
+v1.0.16 or later carry the corrected answer (real track, real
+pregap position, as a real drive reports). Re-run an affected game
+here to fix its package.
+
 CHANGING DISCS MID-GAME
 Packages built from a disc set support swapping while the game runs
 (the package README says the same): when the game asks for another
