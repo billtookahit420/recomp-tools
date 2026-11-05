@@ -366,6 +366,75 @@ def patch_overlay_draw_chain(template, log=print):
 
 OVERLAY_DRAW_CHAIN_SPAN = "/* ---- P2: overlay draw callback -------------------------------------------- */\n/* Registered on the main thread, read on the render / present thread. The\n * function and its context are published together as one immutable record\n * behind an atomic pointer, so a reader never pairs a live function with a\n * stale context.\n *\n * Lifetime: every call runs inside an in-flight count. Replacing or removing\n * the callback swaps the record and then waits until no call that could have\n * read the old record is still running, so when psx_host_overlay_set_draw_cb\n * returns, the previous fn will not run again and its ctx (and the GL objects\n * it draws with) may be freed by the caller. The old record is freed there\n * too. A change made from inside the callback itself does not wait (it would\n * wait for itself); that caller's own frame is the only one still using the\n * old ctx and it returns before the next frame reads the new record. */\n/* Up to two draw consumers share this layer: the in-game menu provider\n * registers first (at session setup) and feature overlays such as the\n * RetroAchievements pop-ups register afterwards. A one-callback record let\n * the later registration silently replace the menu's draw, leaving an open\n * but invisible menu, so the record now keeps both, keyed by function\n * pointer. Entries draw last-registered first, so the first registrant\n * (the menu) paints on top. A NULL fn keeps its historic meaning: the\n * caller is tearing the layer down and every entry is removed. */\n#define PSX_HOST_OVERLAY_DRAW_MAX 2\ntypedef struct {\n    PsxHostOverlayDrawFn fn;\n    void *ctx;\n} PsxHostOverlayDrawEntry;\ntypedef struct {\n    PsxHostOverlayDrawEntry entries[PSX_HOST_OVERLAY_DRAW_MAX];\n    int count;\n} PsxHostOverlayDraw;\n\nstatic _Atomic(PsxHostOverlayDraw *) s_draw = NULL;\nstatic atomic_flag s_draw_set_lock = ATOMIC_FLAG_INIT;\nstatic atomic_int s_draw_inflight = 0;\n#if defined(_MSC_VER)\nstatic __declspec(thread) int s_in_draw = 0;\n#else\nstatic _Thread_local int s_in_draw = 0;\n#endif\n\nstatic void draw_yield(void) {\n#if defined(_WIN32)\n    Sleep(0);\n#else\n    sched_yield();\n#endif\n}\n\nvoid psx_host_overlay_set_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {\n    PsxHostOverlayDraw *rec = NULL, *old;\n    /* Compose the successor from the current record under a lock so two\n     * registering threads cannot lose each other's entry. Readers never\n     * take this lock, so composing cannot deadlock a draw in flight; the\n     * in-flight wait + free below keep the lifetime contract above. */\n    while (atomic_flag_test_and_set(&s_draw_set_lock)) draw_yield();\n    old = atomic_load(&s_draw);\n    if (fn) {\n        int found = -1;\n        rec = (PsxHostOverlayDraw *)malloc(sizeof(*rec));\n        if (!rec) {\n            atomic_flag_clear(&s_draw_set_lock);\n            return;\n        }\n        rec->count = 0;\n        if (old) {\n            for (int i = 0; i < old->count; ++i) {\n                if (old->entries[i].fn == fn) found = rec->count;\n                rec->entries[rec->count++] = old->entries[i];\n            }\n        }\n        if (found >= 0) {\n            rec->entries[found].ctx = ctx; /* re-registering keeps its slot */\n        } else {\n            if (rec->count >= PSX_HOST_OVERLAY_DRAW_MAX)\n                rec->count = PSX_HOST_OVERLAY_DRAW_MAX - 1; /* evict newest other */\n            rec->entries[rec->count].fn = fn;\n            rec->entries[rec->count].ctx = ctx;\n            rec->count++;\n        }\n    }\n    atomic_store(&s_draw, rec); /* seq_cst: ordered with the readers' count */\n    atomic_flag_clear(&s_draw_set_lock);\n    if (s_in_draw) return; /* from inside the callback: see above; old stays (rare) */\n    while (atomic_load(&s_draw_inflight) > 0) draw_yield();\n    free(old);\n}\n\nint psx_host_overlay_has_draw(void) {\n    return atomic_load_explicit(&s_draw, memory_order_acquire) != NULL;\n}\n\nvoid psx_host_overlay_draw(int width, int height) {\n    PsxHostOverlayDraw *rec;\n    if (width <= 0 || height <= 0) return;\n    atomic_fetch_add(&s_draw_inflight, 1); /* seq_cst, before reading the record */\n    rec = atomic_load(&s_draw);\n    if (rec) {\n        s_in_draw = 1;\n        for (int i = rec->count - 1; i >= 0; --i)\n            if (rec->entries[i].fn)\n                rec->entries[i].fn(width, height, rec->entries[i].ctx);\n        s_in_draw = 0;\n    }\n    atomic_fetch_sub(&s_draw_inflight, 1);\n}\n\n"
 
+def patch_cdrom_getlocp(template, log=print):
+    """Fix the runtime's CD GetlocP answer for positions inside a CD-DA
+    track. Upstream cdrom.c's not-playing branch hardcoded track 1 /
+    track_lba 0, so after a SeekP into a music track the sub-Q answer
+    described an impossible position (track 1 at an absolute MSF past
+    track 1's end). Games that poll GetlocP to confirm the seek landed
+    in the target track before starting the level's music/load
+    sequence (Tomb Raider 1 + 2 do exactly this) never got their
+    confirmation and hung on a black screen, no audio, forever.
+    The patch mirrors the CD-DA playing branch: report the track that
+    actually contains the cursor, and give hardware-correct pregap
+    sub-Q (index 0, relative MSF counting DOWN to the track start) —
+    a seek to the GetTD minute:second lands up to 74 sectors early,
+    in the pregap. Idempotent text patch on the template / framework
+    cache and on scaffolded projects (found 2026-11-05, TR1 + TR2
+    verified into gameplay with it)."""
+    try:
+        src = Path(template) / "psxrecomp" / "runtime" / "src" / \
+            "cdrom.c"
+        if not src.exists():
+            return
+        text = src.read_text()
+        if "cdda_track_for_lba((uint32_t)lba)" in text:
+            return
+        old_a = """            lba = msf_to_lba(read_min, read_sec, read_sect);
+        }
+        if (subq_replacements_active) update_last_valid_subq((uint32_t)lba);"""
+        new_a = """            lba = msf_to_lba(read_min, read_sec, read_sect);
+            /* The sub-Q track/index must describe the track that CONTAINS
+             * the cursor, as on hardware — not a constant track 1. After a
+             * SeekP into a CD-DA track, guests poll GetlocP to confirm the
+             * seek landed in the target track before proceeding (Tomb
+             * Raider 1/2 wait for the music track after their level-load
+             * seek; with track hardcoded to 1 the confirmation never
+             * arrives and the load state machine stalls on a black screen
+             * forever). Mirror the playing branch: real containing track,
+             * relative MSF from that track's INDEX 01 start. */
+            track = cdda_track_for_lba((uint32_t)lba);
+            if (track < 1) track = 1;
+            track_lba = (int)iso_cdda_track_start_lba(iso_handle, track);
+        }
+        if (subq_replacements_active) update_last_valid_subq((uint32_t)lba);"""
+        old_b = """            lba_to_msf(lba - track_lba, 0, &rm, &rs, &rf);"""
+        new_b = """            /* Sub-Q index/relative: inside INDEX 01 the relative MSF counts
+             * up from the track start; in the pregap (position before the
+             * track's INDEX 01, e.g. a seek to the GetTD minute:second —
+             * which carries no frame part — lands up to 74 sectors early)
+             * the index is 0 and the relative MSF counts DOWN to the track
+             * start, as the Q channel reports it on hardware. */
+            int index = 1;
+            int rel = lba - track_lba;
+            if (rel < 0) { index = 0; rel = -rel; }
+            lba_to_msf(rel, 0, &rm, &rs, &rf);"""
+        old_c = """            response_push(bin_to_bcd(track));
+            response_push(0x01);"""
+        new_c = """            response_push(bin_to_bcd(track));
+            response_push(bin_to_bcd(index));"""
+        if old_a not in text or old_b not in text or old_c not in text:
+            return
+        text = text.replace(old_a, new_a, 1)
+        text = text.replace(old_b, new_b, 1)
+        text = text.replace(old_c, new_c, 1)
+        src.write_text(text)
+        log("patched cdrom.c: GetlocP reports the real track + pregap "
+            "sub-Q (Tomb Raider 1/2 black-screen fix)")
+    except Exception as e:  # a patch failure must never break a run
+        log(f"cdrom GetlocP patch skipped: {e}")
+
+
 def probe_cue(runner, cue, template, players=1, json_out=None):
     patch_probe_subdir_boot(template,
                             getattr(runner, "log", print))
@@ -1089,6 +1158,7 @@ def run_job(job, log, stop_after=None):
     log(f"template project: {template}")
     patch_probe_subdir_boot(template, log)
     patch_overlay_draw_chain(template, log)
+    patch_cdrom_getlocp(template, log)
     if len(job.cues) > 1:
         # Disc-set routing BEFORE any building: probe every disc and
         # check the set. One program -> fall through and build ONE
@@ -1129,7 +1199,8 @@ def run_job(job, log, stop_after=None):
     steps = [
         ("scaffold", lambda: (stage_scaffold(r, job, template),
                               patch_probe_subdir_boot(job.repo, log),
-                              patch_overlay_draw_chain(job.repo, log))),
+                              patch_overlay_draw_chain(job.repo, log),
+                              patch_cdrom_getlocp(job.repo, log))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
         ("ra", lambda: stage_ra(r, job)),
