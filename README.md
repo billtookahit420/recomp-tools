@@ -41,6 +41,17 @@ UI and RetroAchievements wired in.
 - **OpenBIOS** — the open-source BIOS bundled with PSXRecomp.
 - Cover art: [libretro-thumbnails](https://thumbnails.libretro.com/).
 
+## Changes
+
+- **v1.0.16 (2026-11-05)** — CD position fix: the runtime's GetlocP
+  answer for the not-playing drive hardcoded track 1, so games that
+  confirm a seek into a CD music track before loading a level
+  (Tomb Raider 1 + 2) hung on a black screen with no audio. The
+  engine now patches the framework's `cdrom.c` in the template and
+  in every scaffolded project: GetlocP reports the real containing
+  track with hardware-correct pregap sub-Q. Re-run an affected game
+  here to pick up the fix; TR1 + TR2 verified into gameplay.
+
 ## Notes
 
 - Conversions run **one game at a time** on purpose: parallel Generate
