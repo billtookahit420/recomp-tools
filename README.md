@@ -41,57 +41,52 @@ UI and RetroAchievements wired in.
 - **OpenBIOS** — the open-source BIOS bundled with PSXRecomp.
 - Cover art: [libretro-thumbnails](https://thumbnails.libretro.com/).
 
-## Fixed — before & after
-
-Two runtime defects found in converted games are fixed in the engine,
-with the frames to show it. Both fixes are framework patches the
-engine applies to every new conversion; re-running an affected game
-under the listed release picks the fix up.
-
-### Tomb Raider 1 + 2 — black screen at level load (fixed in v1.0.16)
-
-The runtime's CD GetlocP answer reported the wrong track position, so
-both games waited forever at the load after a music-track seek:
-permanent black screen, no audio. Left: the frame every TR1 load
-landed on before the fix. Right: the same New Game load reaching the
-Caves after it.
-
-![Tomb Raider 1 — before: permanent black screen; after: Caves gameplay](docs/fixes/tr1-before-after.png)
-
-![Tomb Raider 1 — after: the Caves loading screen completes](docs/fixes/tr1-caves-loading.png)
-
-No pre-fix frame of Tomb Raider 2 was kept; it had the same defect
-and got the same fix. Below is TR2 after the fix — the Great Wall
-loading screen was its freeze point — plus the attract demo playing.
-
-![Tomb Raider 2 — after: the Great Wall loading screen completes, and Lara in the level](docs/fixes/tr2-after.png)
-
-![Tomb Raider 2 — after: attract demo (Bartoli's Hideout)](docs/fixes/tr2-bartoli-demo.png)
-
-### Resident Evil: Director's Cut — cropped FMVs (fixed in v1.0.17)
-
-Capcom's movie player uploads each frame as narrow vertical strips,
-which the runtime's movie staging didn't count, so movies rendered
-639 px wide in the 960-px window with the right third black. The
-pair below is the live-action intro before and after — different
-moments of the same movie; the width is the point.
-
-![Resident Evil: Director's Cut — FMV before: 639 px wide; after: full 960 px](docs/fixes/redc-before-after.png)
-
-![Resident Evil: Director's Cut — after: mansion hall gameplay](docs/fixes/redc-mansion-gameplay.png)
-
-### Mega Man 8 — same FMV crop (fixed in v1.0.17)
-
-Mega Man 8 uses the same Capcom strip-upload pattern and is cured by
-the same patch. No pre-fix frame of this game was kept, so only the
-after is shown: the opening FMV at full width, and intro-stage
-gameplay, from the v1.0.17 build.
-
-![Mega Man 8 — after: opening FMV at full width](docs/fixes/mm8-after.png)
-
-![Mega Man 8 — after: intro-stage gameplay](docs/fixes/mm8-gameplay.png)
-
 ## Changes
+
+- **v1.0.18 (2026-11-06)** — Runtime-loaded code (overlay) fix:
+  many games load part of their code from the disc while they
+  run, and in every package built so far that code was stuck in
+  the runtime's slow interpreter — the native overlay tier never
+  engaged, because no package carried the compiler toolchain the
+  runtime needs (measured: a Tekken 1 fight ran 96.8%
+  interpreted). The engine now finishes every conversion of such
+  a game by (1) staging the framework's own pinned
+  `overlay_toolchain/` — built around the game's OWN recompiler
+  binary, as the runtime's stale-toolchain check demands — into
+  both packages, (2) playing the game once headlessly (boot,
+  menus, attract mode) so the runtime captures the code it loads
+  at runtime, (3) compiling the captured set offline into a
+  pre-warmed native shard `cache/` that ships in the package
+  (Windows shards are cross-compiled here; titles whose code
+  runs in CPS mode are detected from their generated dispatch
+  and compiled with the matching flag), and (4) noting it in the
+  package README. A game whose warm session captures nothing
+  ships exactly as before — no toolchain, no cache. Measured on
+  Tekken 1 (SLUS-00006): a fight's interpreter load fell from
+  262–276k instructions/frame (96.8% interpreted) to 14–30
+  instructions/frame once its regions promoted; the shipped
+  cache (19 Linux / 184 Windows shards) covers everything the
+  staging session reached, and the bundled toolchain keeps
+  compiling any remaining code live on your machine the first
+  time you play it. Gran Turismo (SCUS-94194) is the honest
+  exception: staging engages there too (93 Linux / 603 Windows
+  shards ship, and native execution rises from ~0% to ~25% of
+  race time), but its race hot loop stays ~74% interpreted even
+  with every shard compiled — a separate runtime defect that
+  staging is necessary for but does not cure, so GT is NOT
+  fixed by this release; it is measured and labelled as such.
+  Resident Evil: Director's Cut picked up a small cache the
+  same way (it loads one small overlay for its menus). Package
+  sizes grow — the toolchain bundle is ~72 MB before
+  compression; that is the framework's own pinned payload.
+  Windows packages are compile-verified only, as before: their
+  caches are built and layout-validated here, not run-verified.
+  Hardening found by the v1.0.18 clean-room run: staging downloads
+  its pinned Python/TinyCC payloads on first use, and a transient
+  network timeout there no longer kills the whole conversion —
+  the staging step retries (downloads are cached, so a retry
+  resumes where it stopped); only a failure that survives every
+  attempt fails the job.
 
 - **v1.0.17 (2026-11-05)** — FMV crop fix: the runtime's depth24
   (24-bit movie) upload-span tracker only counted CPU→VRAM uploads
