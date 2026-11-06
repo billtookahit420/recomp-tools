@@ -113,7 +113,8 @@ def ensure_framework_cache(log):
         if dst.is_dir() and any(dst.iterdir()):
             continue
         log(f"downloading framework: {url}")
-        res = subprocess.run(["git", "clone", "--depth", "1", url,
+        res = subprocess.run(["git", "clone", "--depth", "1",
+                              "--recurse-submodules", url,
                               str(dst)], capture_output=True, text=True)
         if res.returncode != 0:
             log("clone failed: " + (res.stderr or "")[-300:])
@@ -433,6 +434,55 @@ def patch_cdrom_getlocp(template, log=print):
             "sub-Q (Tomb Raider 1/2 black-screen fix)")
     except Exception as e:  # a patch failure must never break a run
         log(f"cdrom GetlocP patch skipped: {e}")
+
+
+GPU_DEPTH24_OLD_A = "/* Depth24: note/query/reset the CPU→VRAM upload span tracked above. Used to\n * hide trailing RGB columns when a movie blit doesn't fill the full CRTC\n * width — MotK's Star Wars crawl leaves ~8px of stale VRAM on the right.\n * Only FB-class A0s (w >= 256 halfwords) grow the span; texture uploads must\n * not collapse it. During present-hold, ignore updates entirely. */\nstatic void depth24_note_upload(uint32_t x, uint32_t w) {\n    if (!(display_depth & 1u) || w < 256u) return;\n"
+
+GPU_DEPTH24_NEW_A = '/* Depth24: note/query/reset the CPU→VRAM upload span tracked above. Used to\n * hide trailing RGB columns when a movie blit doesn\'t fill the full CRTC\n * width — MotK\'s Star Wars crawl leaves ~8px of stale VRAM on the right.\n * Every A0 counts, whatever its width: real STR players upload a frame as\n * many narrow strips (RE: Director\'s Cut blits its 320-px movies as 20\n * strips of 24 halfwords x 240), so a "FB-class only" (w >= 256) filter\n * never sees the movie\'s own coverage — the span then reflects any stray\n * wide upload instead (a 320-halfword 15-bit still shown between movies\n * capped RE\'s span at 320 halfwords = 213 RGB px, and the present blacked\n * out the right third of every subsequent movie frame). The span is a\n * max-extent, so stray uploads can only be outgrown by the movie\'s own\n * blits, which follow within a frame. During present-hold, ignore updates\n * entirely. */\nstatic void depth24_note_upload(uint32_t x, uint32_t w) {\n    if (!(display_depth & 1u)) return;\n'
+
+GPU_DEPTH24_OLD_B = '    if (rows == 0u || w < 8u || margin == 0u || margin >= w)\n        return rows;\n    uint32_t start = w - margin;\n    uint32_t lim = gpu_depth24_rgb_limit(di->display_x, w);\n    if (lim > 0u && lim < w && lim < start)\n        start = lim;\n'
+
+GPU_DEPTH24_NEW_B = "    if (rows == 0u || w < 8u)\n        return rows;\n    uint32_t lim = gpu_depth24_rgb_limit(di->display_x, w);\n    uint32_t start;\n    if (lim >= w) {\n        /* The guest's uploads cover the full CRTC width: no column is\n         * stale, so blank nothing. (Previously the margin fallback still\n         * clipped the last `margin` real columns of a fully covered\n         * frame — RE: Director's Cut's movies lost their right 8 px.) */\n        return rows;\n    } else if (lim > 0u) {\n        /* Blank exactly the uncovered tail past the covered span. */\n        start = lim;\n    } else {\n        /* No coverage information yet: legacy margin-only blanking. */\n        if (margin == 0u || margin >= w)\n            return rows;\n        start = w - margin;\n    }\n"
+def patch_gpu_depth24_span(template, log=print):
+    """Fix the runtime's depth24 (24-bit movie) upload-span tracker.
+    Upstream gpu.c's tracker only counted CPU->VRAM uploads at least
+    256 halfwords wide ("FB-class"), but real STR players upload each
+    movie frame as many narrow vertical strips (Resident Evil:
+    Director's Cut blits its 320-px movies as 20 strips of 24x240), so
+    the movie's own coverage never registered - the span instead
+    reflected a stray wide still shown between movies (320 halfwords =
+    213 RGB px), and the depth24 staging pass blacked out every movie
+    frame past that limit: the right third of RE DC's live-action
+    intro, and the same crop in Mega Man 8 (same Capcom strip-upload
+    pattern). The staging pass also clipped the last `margin` columns
+    of even a fully covered frame via its no-info fallback (RE DC's
+    logo sequence lost its right 8 px). The patch counts every upload
+    while depth24 is on (the span is a max-extent, so the movie's own
+    strips outgrow any stray still within one frame) and makes the
+    staging blank nothing at full coverage, otherwise exactly the
+    uncovered tail - the narrow-blit case the fill was built for (the
+    framework's MotK crawl) still blanks its stale tail.
+    Idempotent text patch on the template / framework cache and on
+    scaffolded projects (found 2026-11-05, RE DC verified on camera:
+    intro + logo + story FMVs full width, OpenGL and Software)."""
+    try:
+        src = Path(template) / "psxrecomp" / "runtime" / "src" / \
+            "gpu.c"
+        if not src.exists():
+            return
+        text = src.read_text()
+        if "Every A0 counts, whatever its width" in text:
+            return
+        if GPU_DEPTH24_OLD_A not in text or GPU_DEPTH24_OLD_B not in text:
+            return
+        text = text.replace(GPU_DEPTH24_OLD_A, GPU_DEPTH24_NEW_A, 1)
+        text = text.replace(GPU_DEPTH24_OLD_B, GPU_DEPTH24_NEW_B, 1)
+        src.write_text(text)
+        log("patched gpu.c: depth24 span counts every upload; staging "
+            "blanks only the uncovered tail (RE DC / Mega Man 8 FMV "
+            "crop fix)")
+    except Exception as e:  # a patch failure must never break a run
+        log(f"gpu depth24 span patch skipped: {e}")
 
 
 def probe_cue(runner, cue, template, players=1, json_out=None):
@@ -1159,6 +1209,7 @@ def run_job(job, log, stop_after=None):
     patch_probe_subdir_boot(template, log)
     patch_overlay_draw_chain(template, log)
     patch_cdrom_getlocp(template, log)
+    patch_gpu_depth24_span(template, log)
     if len(job.cues) > 1:
         # Disc-set routing BEFORE any building: probe every disc and
         # check the set. One program -> fall through and build ONE
@@ -1200,7 +1251,8 @@ def run_job(job, log, stop_after=None):
         ("scaffold", lambda: (stage_scaffold(r, job, template),
                               patch_probe_subdir_boot(job.repo, log),
                               patch_overlay_draw_chain(job.repo, log),
-                              patch_cdrom_getlocp(job.repo, log))),
+                              patch_cdrom_getlocp(job.repo, log),
+                              patch_gpu_depth24_span(job.repo, log))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
         ("ra", lambda: stage_ra(r, job)),
