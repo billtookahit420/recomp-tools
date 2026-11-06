@@ -43,6 +43,24 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.17 (2026-11-05)** — FMV crop fix: the runtime's depth24
+  (24-bit movie) upload-span tracker only counted CPU→VRAM uploads
+  ≥256 halfwords wide, but Capcom's STR players upload each movie
+  frame as narrow vertical strips (Resident Evil: Director's Cut:
+  20 strips of 24×240), so a movie's true coverage never registered
+  and the staging pass blacked out every frame past a stale 213-px
+  limit — movies rendered ~2/3 width, hard against the left edge,
+  while gameplay was full width. The engine now patches the
+  framework's `gpu.c` in the template and in every scaffolded
+  project: every upload counts toward the span while depth24 is on,
+  and the staging blanks nothing at full coverage, otherwise exactly
+  the uncovered tail (the narrow-blit stale-VRAM case the fill was
+  built for still blanks its tail). Re-run an affected game here to
+  pick up the fix; RE Director's Cut verified on camera (intro, logo
+  and story FMVs full width). Mega Man 8 uses the same upload
+  pattern and is cured by the same patch. Windows packages are
+  compile-verified only, as before.
+
 - **v1.0.16 (2026-11-05)** — CD position fix: the runtime's GetlocP
   answer for the not-playing drive hardcoded track 1, so games that
   confirm a seek into a CD music track before loading a level
