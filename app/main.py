@@ -84,6 +84,20 @@ v1.0.16 or later carry the corrected answer (real track, real
 pregap position, as a real drive reports). Re-run an affected game
 here to fix its package.
 
+MOVIES CUT OFF AT THE RIGHT (FIXED IN v1.0.17)
+Some games' movies (FMVs) played with the right side cut off - the
+picture stopped about two-thirds across with black beyond it, while
+gameplay rendered full width (Resident Evil: Director's Cut and
+Mega Man 8 are the known cases). The framework's 24-bit movie path
+tracked how much of the screen width the game's movie uploads had
+covered, but only counted uploads at least 256 units wide - and
+these games upload each movie frame as many thin vertical strips,
+so the coverage never registered and the presenter blacked out
+everything past a stale, narrower width. Builds made with v1.0.17
+or later carry the corrected tracking (every upload counts; only a
+genuinely uncovered tail is blanked). Re-run an affected game here
+to fix its package.
+
 CHANGING DISCS MID-GAME
 Packages built from a disc set support swapping while the game runs
 (the package README says the same): when the game asks for another
