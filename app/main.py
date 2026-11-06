@@ -54,7 +54,10 @@ pipeline used for all of Duane's delivered recomps:
                  (function count + entry-point symbol).
   9. Package   - stages a clean folder and zips it: game binary, clean
                  config, OpenBIOS, launcher assets, mods, README, and
-                 your RetroAchievements file if you picked one.
+                 your RetroAchievements file if you picked one. For
+                 games that load code at runtime it also stages the
+                 overlay compiler bundle and a pre-warmed native shard
+                 cache (see the stutter section below).
 
 THE QUEUE
 Add discs with "Add Disc". Games convert ONE AT A TIME, start to
@@ -97,6 +100,23 @@ everything past a stale, narrower width. Builds made with v1.0.17
 or later carry the corrected tracking (every upload counts; only a
 genuinely uncovered tail is blanked). Re-run an affected game here
 to fix its package.
+
+GAMES THAT STUTTER ON RUNTIME-LOADED CODE (IMPROVED IN v1.0.18)
+Some games load part of their code from the disc while they run
+(Gran Turismo and Tekken 1 are the known cases). That code cannot
+be compiled ahead of time, so earlier builds ran it in a slow
+built-in interpreter - a big share of those games' stutter. Builds
+made with v1.0.18 or later fix the packaging: the converter runs
+the finished game once with the framework's compiler bundle
+staged beside it, lets the game compile its runtime-loaded code
+into native shards, and ships both the bundle (overlay_toolchain/)
+and the pre-compiled shard cache in the package. The covered code
+then runs natively from the first launch, and the bundle keeps
+compiling any code the warm-up run did not reach. Games that load
+no code at runtime convert exactly as before. One honest limit:
+Gran Turismo's hottest loop has a second, separate problem - it
+stays partly interpreted even with the bundle staged - so this
+removes the packaging half of its stutter, not all of it.
 
 CHANGING DISCS MID-GAME
 Packages built from a disc set support swapping while the game runs
