@@ -101,6 +101,22 @@ or later carry the corrected tracking (every upload counts; only a
 genuinely uncovered tail is blanked). Re-run an affected game here
 to fix its package.
 
+WALLS AND FLOORS WITH DENSE VERTICAL STRIPES (FIXED IN v1.0.19,
+SOFTWARE + OPENGL RENDERERS)
+Doom-engine games (Doom, Final Doom) drew their worlds from
+one-pixel-thin textured strips whose edges the hi-res renderer
+covered inexactly, so thin dark slivers showed through in a
+regular stripe pattern at internal resolutions above 1x, and
+hairline seams could appear along wall/floor joins even at 1x
+under OpenGL. Builds made with v1.0.19 or later fix BOTH the
+SOFTWARE and OPENGL renderers' coverage: each decides coverage
+on the game's own pixel grid (the same rule the native
+renderer uses), so strips tile exactly at any internal
+resolution. Verified on Final Doom: stripe modulation
+19.8% -> 0.7% at 4x (Software), 14.2% -> 0.33% at 4x (OpenGL).
+The Vulkan renderer does not have this fix yet - for
+Doom-engine games, use the Software or OpenGL renderer.
+
 GAMES THAT STUTTER ON RUNTIME-LOADED CODE (IMPROVED IN v1.0.18)
 Some games load part of their code from the disc while they run
 (Gran Turismo and Tekken 1 are the known cases). That code cannot
