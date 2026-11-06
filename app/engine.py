@@ -48,6 +48,8 @@ TOOLS = {
     "nm": "nm (verification)",
     "x86_64-w64-mingw32-nm": "MinGW nm (verification)",
     "zip": "zip (packaging)",
+    "xdotool": "xdotool (overlay warm run input)",
+    "Xvfb": "Xvfb (overlay warm run display)",
 }
 
 
@@ -71,6 +73,7 @@ LINUX_SYSTEM_PACKAGES = [
     "libxcursor-dev", "libxi-dev", "libxss-dev", "libxkbcommon-dev",
     "libdrm-dev", "libgbm-dev", "libegl-dev", "libdbus-1-dev",
     "libvulkan-dev", "glslang-tools", "glslc",
+    "xdotool", "xvfb",
 ]
 
 
@@ -230,6 +233,12 @@ class Job:
     probes: list = field(default_factory=list)   # probe JSON dicts, per cue
     set_verdict: dict = field(default_factory=dict)
     vulkan_backend: dict = field(default_factory=dict)
+    overlay_info: dict = field(default_factory=dict)
+    # target ("linux"/"windows") -> {"shards": n, "tag": cg-tag,
+    # "cache": bool} when the package carries the staged overlay
+    # toolchain (+ pre-warmed shard cache). Filled by stage_overlay,
+    # read by package_readme. Empty for games that load no code at
+    # runtime - their packages are unchanged.
     # target ("linux"/"windows") -> True when that target's build tree
     # proved a real Vulkan backend (vk_shaders_spv.h). Filled by
     # stage_build, read by stage_package: the package offers Vulkan
@@ -940,6 +949,531 @@ def stage_verify(r, job):
         r.log(f"verify OK: {exe.name} has {count} game functions, entry present")
 
 
+# ---------------------------------------------------------------- overlay staging
+#
+# Defect A (stutter investigation, 2026-11-05): games that load code
+# from the disc at runtime (Gran Turismo, Tekken 1) keep that code in
+# "overlays", and the runtime can compile overlays to native shards -
+# but only when a toolchain is staged beside the executable. No
+# shipped package ever staged one, so every overlay game ran its game
+# code in the slow dirty-RAM interpreter permanently (~269k
+# interpreted instructions per frame in Gran Turismo). The framework
+# ships the staging machinery (psxrecomp/tools/release_stage.py -
+# the single source of truth for the cache tag and toolchain layout);
+# this section drives it. Nothing here re-derives a tag or a layout.
+
+def overlay_dl_cache():
+    """App-managed download cache for the framework's pinned toolchain
+    archives. release_stage.py verifies SHA256 on every use."""
+    return Path(__file__).resolve().parent.parent / "toolchain-dl-cache"
+
+
+def _release_stage(r, job, args, timeout=3600):
+    script = job.repo / "psxrecomp" / "tools" / "release_stage.py"
+    if not script.exists():
+        raise StageError(f"framework release_stage.py missing: {script}")
+    return r.run_ok(["python3", script, *args], timeout=timeout)
+
+
+def _cg_tag(r, job, game_toml, build_dir):
+    """The overlay cache namespace for a PACKAGED game.toml, from
+    release_stage.py cg-tag. The tag must come from the packaged
+    game.toml (the one the shipped runtime loads), never the dev one.
+    The config-hash query runs the LINUX recompiler for both
+    platforms: the hash serializes canonical game.toml fields in code
+    shared by every emitter build, so the value is platform-free;
+    only the flavor comes from the target's own build dir."""
+    repo = job.repo
+    script = repo / "psxrecomp" / "tools" / "release_stage.py"
+    out = subprocess.run(
+        ["python3", script, "cg-tag",
+         "--runtime-include", repo / "psxrecomp" / "runtime" / "include",
+         "--recompiler", repo / "build-recompiler" / "psxrecomp-game",
+         "--game-toml", game_toml,
+         "--flavor-from-build", build_dir],
+        capture_output=True, text=True)
+    lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    if out.returncode != 0 or not lines:
+        raise StageError("release_stage cg-tag failed: "
+                         + (out.stderr or out.stdout)[-400:])
+    return lines[-1]
+
+
+def stage_emitters_mingw(r, job):
+    """Cross-build the Windows emitter binaries (psxrecomp-game.exe,
+    psxrecomp-bios.exe) from THIS project's framework tree.
+    stage-toolchain --platform win stages these into the Windows
+    package; an emitter from any other tree would produce shards
+    under a codegen hash the shipped runtime never reads (the
+    stale-recompiler failure class). The MinGW runtime DLLs the
+    emitters import are copied beside them - the exact files this
+    machine's compiler driver names - where release_stage looks."""
+    repo = job.repo
+    bdir = repo / "build-recompiler-mingw"
+    game_exe = bdir / "psxrecomp-game.exe"
+    bios_exe = bdir / "psxrecomp-bios.exe"
+    if not (game_exe.exists() and bios_exe.exists()):
+        tc = repo / "psxrecomp" / "cmake" / "toolchain-mingw-w64.cmake"
+        r.run_ok(["cmake", "-S", repo / "psxrecomp" / "recompiler",
+                  "-B", bdir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+                  f"-DCMAKE_TOOLCHAIN_FILE={tc}"], timeout=900)
+        r.run_ok(["cmake", "--build", bdir, "--target", "psxrecomp-game",
+                  "psxrecomp-bios", "-j", job.settings.jobs],
+                 timeout=1800)
+    for exe in (game_exe, bios_exe):
+        if not exe.exists() or exe.stat().st_size == 0:
+            raise StageError(
+                f"Windows emitter build finished but {exe} is missing/empty")
+    copied = []
+    for dll in ("libgcc_s_seh-1.dll", "libstdc++-6.dll",
+                "libwinpthread-1.dll"):
+        if (bdir / dll).exists():
+            continue
+        q = subprocess.run(["x86_64-w64-mingw32-gcc",
+                            f"-print-file-name={dll}"],
+                           capture_output=True, text=True)
+        src = Path(q.stdout.strip())
+        if src.is_file():
+            shutil.copy2(src, bdir / dll)
+            copied.append(dll)
+    r.log("Windows emitters ready: psxrecomp-game.exe + psxrecomp-bios.exe"
+          + (f" (MinGW DLLs staged: {', '.join(copied)})" if copied else ""))
+    return bdir
+
+
+def stage_toolchain_into(r, job, stage_dir, target):
+    """Stage the framework's self-contained overlay toolchain into a
+    package dir (release_stage.py stage-toolchain): pinned Python +
+    TinyCC, THIS project's own emitter binaries, runtime headers,
+    BIOS profiles, seeds. The runtime finds it beside the exe and
+    builds its autocompile command from it (runtime main.cpp); no
+    game.toml command is written - an explicit one would bypass the
+    runtime's stale-toolchain hash check."""
+    repo = job.repo
+    if target == "linux":
+        recomp_dir, platform = repo / "build-recompiler", "linux"
+        gate = stage_dir / "overlay_toolchain" / "python" / "bin" / "python3"
+    else:
+        recomp_dir, platform = repo / "build-recompiler-mingw", "win"
+        gate = stage_dir / "overlay_toolchain" / "python" / "python.exe"
+    # stage-toolchain downloads its pinned Python/TinyCC payloads on
+    # first use; a transient network timeout must not kill a whole
+    # conversion, so retry a few times (the download cache keeps
+    # whatever already arrived, and the step is idempotent). A
+    # failure that survives every attempt still fails the job.
+    args = [
+        "stage-toolchain", "--stage", stage_dir,
+        "--recomp-dir", recomp_dir,
+        "--recomp-tools", repo / "psxrecomp" / "tools",
+        "--recomp-include", repo / "psxrecomp" / "runtime" / "include",
+        "--dl-cache", overlay_dl_cache(),
+        "--platform", platform]
+    for attempt in (1, 2, 3):
+        try:
+            _release_stage(r, job, args)
+            break
+        except StageError:
+            if attempt == 3:
+                raise
+            r.log(f"stage-toolchain ({target}) attempt {attempt} "
+                  "failed - retrying in 20 s (payload downloads are "
+                  "cached, so a retry resumes where it stopped)")
+            time.sleep(20)
+    if not gate.exists():
+        raise StageError(
+            f"stage-toolchain finished but {gate} is missing - the "
+            "runtime's autocompile gate would be false for this package")
+    r.log(f"overlay toolchain staged ({target}) in {stage_dir}")
+
+
+def _stage_cache(r, job, game_id, cache_src_root, stage, tag,
+                 arch_abi=None, shared_ext=None):
+    """Copy the shippable shards for `tag` out of a producer cache
+    into <stage>/cache/<game_id>, through release_stage.py's own
+    validation (exact layout match; producer files - generated .c,
+    pair-locks, ABI memos, in-progress temp shards - never ship).
+    Returns the staged shard count."""
+    repo = job.repo
+    count_file = repo / ".shard-count.txt"
+    args = ["stage-cache", "--game-id", game_id,
+            "--cache-src-root", cache_src_root,
+            "--stage", stage, "--cg-tag", tag,
+            "--count-file", count_file]
+    if arch_abi:
+        args += ["--arch-abi", arch_abi]
+    if shared_ext:
+        args += ["--shared-ext", shared_ext]
+    _release_stage(r, job, args)
+    try:
+        return int(count_file.read_text().strip())
+    finally:
+        count_file.unlink(missing_ok=True)
+
+
+WARM_MIN_S = 240        # shortest warm run (the no-overlay gate needs
+                        # a fair boot + menu + attract window, even
+                        # on a slow or busy machine - a run that ends
+                        # before the game reaches gameplay would
+                        # misread an overlay game as a static one)
+WARM_MAX_S = 600        # hard cap
+WARM_QUIET_S = 45       # stop this long after the last capture/compile
+WARM_FIGHT_S = 240      # once overlay code starts executing, keep
+                        # the session in gameplay at least this long
+                        # before the quiet rule may end it: captures
+                        # grow in bursts at round/stage transitions,
+                        # and a 45 s lull mid-fight would ship a
+                        # one-stage cache (measured: 19 shards vs
+                        # 182 from near-identical sessions)
+
+
+def _free_display():
+    for n in range(77, 90):
+        if not Path(f"/tmp/.X{n}-lock").exists():
+            return n
+    return None
+
+
+def _warm_send_key(env, xdotool, title, key):
+    """Best-effort synthetic keypress to the game window."""
+    try:
+        out = subprocess.run(
+            [xdotool, "search", "--name", f"{title} Recompiled"],
+            capture_output=True, text=True, env=env, timeout=10)
+        wins = out.stdout.split()
+        if not wins:
+            out = subprocess.run(
+                [xdotool, "search", "--name", "Recompiled"],
+                capture_output=True, text=True, env=env, timeout=10)
+            wins = out.stdout.split()
+        if not wins:
+            return
+        subprocess.run([xdotool, "windowfocus", "--sync", wins[-1]],
+                       capture_output=True, env=env, timeout=10)
+        subprocess.run([xdotool, "key", key],
+                       capture_output=True, env=env, timeout=10)
+    except Exception:
+        pass
+
+
+def warm_run_overlay(r, job, warm):
+    """Run the packaged game once - in a scratch copy of the package
+    with the toolchain already staged - so the runtime captures its
+    runtime-loaded code and compiles native shards into warm/cache.
+
+    A generic input pattern (Start/Cross on a schedule) walks most
+    games from title into menus and gameplay; the attract mode covers
+    the rest. Returns (shard_count, captures_path_or_None). Raises
+    StageError when the run never reaches the runtime's overlay init:
+    a broken boot must never masquerade as 'this game has no
+    overlays'."""
+    repo, name = job.repo, job.name
+    exe = warm / name
+    game_id = disc_id(job.probes[0])
+    log_path = repo / "warm-run.log"
+    env = dict(os.environ)
+    env["SDL_AUDIODRIVER"] = "dummy"
+    xvfb = None
+    if not env.get("DISPLAY"):
+        n = _free_display()
+        xvfb_bin = shutil.which("Xvfb")
+        if n is None or not xvfb_bin:
+            raise StageError(
+                "overlay warm run needs a display: $DISPLAY is unset "
+                "and Xvfb is not installed (the toolbox Install button "
+                "adds xvfb + xdotool)")
+        xvfb = subprocess.Popen([xvfb_bin, f":{n}", "-screen", "0",
+                                 "1280x720x24"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        env["DISPLAY"] = f":{n}"
+        time.sleep(2)
+    xdotool = shutil.which("xdotool")
+    if not xdotool:
+        r.log("xdotool not installed - warm run relies on the game's "
+              "attract mode (no synthetic input); the toolbox Install "
+              "button adds it")
+    keys = ["Return", "X", "Return", "X", "Z"]   # Start Cross Start Cross Square
+    r.log(f"overlay warm run: launching {exe.name} with the staged "
+          "toolchain (boot + menus + attract, up to "
+          f"{WARM_MAX_S}s) - full log: {log_path}")
+    try:
+        with open(log_path, "wb") as lf:
+            proc = subprocess.Popen(
+                [str(exe), "--disc", job.cues[0], "--no-launcher"],
+                cwd=warm, env=env, stdout=lf, stderr=subprocess.STDOUT,
+                start_new_session=True)
+            start = time.time()
+            last_growth = start
+            last_sig = None
+            first_capture = None
+            key_i = 0
+            next_key = start + 20
+            while True:
+                now = time.time()
+                elapsed = now - start
+                if proc.poll() is not None:
+                    break
+                cache_dir = warm / "cache" / game_id
+                count = (len(list(cache_dir.rglob("*.so")))
+                         if cache_dir.is_dir() else 0)
+                cap = warm / "overlay_captures.json"
+                cap_live = cap.exists() and cap.stat().st_size > 10
+                sig = (count, cap.stat().st_mtime if cap.exists() else 0)
+                if sig != last_sig:
+                    last_sig = sig
+                    last_growth = now
+                if first_capture is None and (count > 0 or cap_live):
+                    first_capture = now
+                if xdotool and now >= next_key:
+                    _warm_send_key(env, xdotool, job.title,
+                                   keys[key_i % len(keys)])
+                    key_i += 1
+                    next_key = now + 15
+                if now - last_growth >= WARM_QUIET_S:
+                    if first_capture is None and elapsed >= WARM_MIN_S:
+                        break
+                    if (first_capture is not None
+                            and now - first_capture >= WARM_FIGHT_S):
+                        break
+                if elapsed >= WARM_MAX_S:
+                    break
+                time.sleep(3)
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+    finally:
+        if xvfb is not None:
+            xvfb.terminate()
+    log_text = (log_path.read_text(errors="replace")
+                if log_path.exists() else "")
+    for line in log_text.splitlines():
+        if ("tier using bundled toolchain" in line
+                or "overlay autocompile enabled" in line
+                or "no bundled toolchain" in line):
+            r.log("warm run: " + line.strip())
+    if "overlay autocompile enabled" not in log_text:
+        raise StageError(
+            "overlay warm run never reached overlay init (no "
+            "'overlay autocompile enabled' line in warm-run.log) - "
+            "the game did not boot with the staged toolchain; see "
+            f"{log_path}")
+    cache_dir = warm / "cache" / game_id
+    count = (len(list(cache_dir.rglob("*.so")))
+             if cache_dir.is_dir() else 0)
+    cap = warm / "overlay_captures.json"
+    return count, (cap if cap.exists() else None)
+
+
+def _title_cps_mode(job):
+    """True when the title's generated code runs the runtime in CPS
+    (continuation-passing) mode: the generated dispatch carries the
+    marker `g_psx_cps_mode = 1` (its own comment: 'CPS runtime-mode
+    marker (the overlay loader reads g_psx_cps_mode)'). Overlay
+    shards MUST be compiled with the matching mode - the runtime
+    passes --cps to its own autocompile for such titles, and
+    compile_overlays warns the flag 'must match the runtime build'.
+    A mismatched shard is not caught by the cache tag or the layout
+    validation, so the offline compiles below take the flag from
+    here, never from a guess."""
+    gen = job.repo / "generated"
+    if not gen.is_dir():
+        return False
+    needle = b"g_psx_cps_mode = 1"
+    for f in gen.glob("*_dispatch.c"):
+        try:
+            with open(f, "rb") as fh:
+                tail = b""
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    if needle in tail + chunk:
+                        return True
+                    tail = chunk[-len(needle):]
+        except OSError:
+            continue
+    return False
+
+
+def compile_offline_cache(r, job, toml_path, toolchain_dir, captures,
+                          target):
+    """Compile the warm run's captures into a FRESH cache dir with
+    the framework's compile_overlays.py - the full offline pass
+    (region audits, strong-root supplements, demand batching).
+    This matters: the runtime's own in-session autocompile is
+    lazy, compiles fewer shards per region, and its incremental
+    skip then blocks the fuller decomposition for any region it
+    already touched (measured on Tekken 1: 20 shards live+top-up
+    vs 182 from a fresh offline pass over the same captures).
+    Returns the scratch cache root, or None on failure - callers
+    fall back to the live-compiled cache / toolchain-only.
+    --cps follows the title's generated dispatch marker (see
+    _title_cps_mode); the Windows pass cross-compiles with the
+    MinGW gcc, the Linux pass uses the host gcc."""
+    if captures is None or not Path(captures).exists():
+        return None
+    repo = job.repo
+    scratch = repo / f"warm-{target}-cache"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    cmd = ["python3", repo / "psxrecomp" / "tools" / "compile_overlays.py",
+           "--captures", captures,
+           "--game-toml", toml_path,
+           "--recompiler", repo / "build-recompiler" / "psxrecomp-game",
+           "--runtime-include", repo / "psxrecomp" / "runtime" / "include",
+           "--project-root", toolchain_dir,
+           "--out-dir", scratch,
+           "--compiler", "gcc"]
+    build_dir = repo / ("build-windows" if target == "windows"
+                        else "build-release")
+    flavor = "0"
+    ff = build_dir / "psxrecomp_overlay_flavor-psx-runtime.txt"
+    if ff.exists() and ff.read_text().strip().isdigit():
+        flavor = ff.read_text().strip()
+    if target == "windows":
+        cmd += ["--gcc", "x86_64-w64-mingw32-gcc",
+                "--target-os", "win", "--arch-abi", "win-x64",
+                "--flavor", flavor]
+    else:
+        cmd += ["--target-os", "linux", "--arch-abi", "linux-x64",
+                "--flavor", flavor]
+    if _title_cps_mode(job):
+        cmd.append("--cps")
+    rc = r.run(cmd, timeout=3600)
+    if rc != 0:
+        r.log(f"offline {target} shard compile failed (see log)")
+        shutil.rmtree(scratch, ignore_errors=True)
+        return None
+    return scratch
+
+
+def _merge_live_cache(offline_scratch, live_cache):
+    """Union of the offline-compiled cache and the warm run's
+    live-compiled cache (the offline files win on conflicts; the
+    live pass can hold a shard for state the final captures file
+    no longer lists). Returns the merged dir (the scratch)."""
+    if live_cache.is_dir():
+        for f in live_cache.rglob("*"):
+            if f.is_file():
+                dest = offline_scratch / f.relative_to(live_cache)
+                if not dest.exists():
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, dest)
+    return offline_scratch
+
+
+def stage_overlay(r, job, stages):
+    """Toolchain staging + shard-cache pre-warm for overlay games.
+
+    Evidence-gated: the packaged Linux build runs once with the
+    toolchain staged; only a game that actually captures overlay
+    code gets the toolchain (and the validated, pre-warmed cache)
+    in its packages. A game with no runtime-loaded code ships
+    exactly as before. Returns {target: info} for the README."""
+    info = {}
+    if "linux" not in stages:
+        r.log("overlay staging skipped: this job builds no Linux "
+              "package to warm-run (the shard cache is produced by "
+              "running the game)")
+        return info
+    repo, name = job.repo, job.name
+    game_id = disc_id(job.probes[0])
+    warm_root = repo / "warm-linux"
+    warm = warm_root / name
+    if warm_root.exists():
+        shutil.rmtree(warm_root)
+    shutil.copytree(stages["linux"], warm)
+    try:
+        stage_toolchain_into(r, job, warm, "linux")
+        shards, captures = warm_run_overlay(r, job, warm)
+        caps_n = 0
+        if captures is not None:
+            try:
+                caps_n = len(json.loads(
+                    Path(captures).read_text(errors="replace")))
+            except Exception:
+                caps_n = 0
+        if shards <= 0 and caps_n <= 0:
+            r.log("overlay warm run: no overlay code captured across "
+                  "boot / menus / attract - this game does not load "
+                  "code at runtime; packages ship without the "
+                  "overlay toolchain (layout unchanged)")
+            return info
+        r.log(f"overlay warm run: {shards} shard(s) compiled live, "
+              f"{caps_n} capture entr(ies) recorded for {game_id}")
+        # Linux package: toolchain + validated cache for ITS toml.
+        # The shipped cache comes from the full offline compile of
+        # the captures (fresh dir - see compile_offline_cache),
+        # merged with whatever the live pass compiled.
+        stage_toolchain_into(r, job, stages["linux"], "linux")
+        tag = _cg_tag(r, job, stages["linux"] / "game.toml",
+                      repo / "build-release")
+        src = warm / "cache"
+        scratch = None
+        if captures is not None:
+            scratch = compile_offline_cache(
+                r, job, warm / "game.toml", warm / "overlay_toolchain",
+                captures, "linux")
+            if scratch is not None:
+                src = _merge_live_cache(scratch, warm / "cache")
+        try:
+            n = _stage_cache(r, job, game_id, src,
+                             stages["linux"], tag)
+            info["linux"] = {"shards": n, "tag": tag, "cache": True}
+            r.log(f"Linux package: overlay toolchain + {n} "
+                  f"pre-compiled shard(s) [{tag}]")
+        except StageError as ex:
+            info["linux"] = {"shards": 0, "tag": tag, "cache": False}
+            r.log("Linux package: overlay toolchain staged WITHOUT "
+                  f"a validated cache ({ex}) - the bundled "
+                  "toolchain compiles shards on the player's "
+                  "machine at first play")
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+        if captures is not None:
+            keep = repo / "overlay_captures.json"
+            shutil.copy2(captures, keep)
+            r.log(f"overlay captures kept in the project: {keep}")
+        if "windows" in stages:
+            stage_emitters_mingw(r, job)
+            stage_toolchain_into(r, job, stages["windows"], "windows")
+            wtag = _cg_tag(r, job, stages["windows"] / "game.toml",
+                           repo / "build-windows")
+            wn = None
+            if captures is not None:
+                wscratch = compile_offline_cache(
+                    r, job, stages["windows"] / "game.toml",
+                    stages["windows"] / "overlay_toolchain",
+                    captures, "windows")
+                if wscratch is not None:
+                    try:
+                        wn = _stage_cache(
+                            r, job, game_id, wscratch,
+                            stages["windows"], wtag,
+                            arch_abi="win-x64", shared_ext=".dll")
+                    except StageError as ex:
+                        r.log("offline Windows cache did not "
+                              f"validate ({ex})")
+                    shutil.rmtree(wscratch, ignore_errors=True)
+            info["windows"] = {"shards": wn or 0, "tag": wtag,
+                               "cache": bool(wn)}
+            if wn:
+                r.log(f"Windows package: overlay toolchain + {wn} "
+                      f"pre-compiled shard(s) [{wtag}]")
+            else:
+                r.log("Windows package: overlay toolchain staged "
+                      "WITHOUT a pre-compiled cache - the bundled "
+                      "toolchain compiles shards on the player's "
+                      "machine at first play")
+        return info
+    finally:
+        shutil.rmtree(warm_root, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- packaging
 
 def disc_id(probe):
@@ -1016,7 +1550,7 @@ def package_game_toml(job, offer_vulkan=False):
     return "\n".join(lines)
 
 
-def package_readme(job, offer_vulkan=False):
+def package_readme(job, offer_vulkan=False, overlay=None):
     probe = job.probes[0]
     s = job.settings
     multi = ""
@@ -1065,6 +1599,28 @@ def package_readme(job, offer_vulkan=False):
         ss = ("\n## Save states\n\nSave-state hotkeys (F7/F8) are unbound in "
               "the included `config.ini` (Recomp Tools setting). Delete that "
               "file or rebind the keys in the launcher to use save states.\n")
+    ov = ""
+    if overlay:
+        cache = (f" It also carries a pre-compiled native shard cache "
+                 f"({overlay['shards']} shard(s)) built from a real play "
+                 f"session, so the covered code runs native from the "
+                 f"first launch."
+                 if overlay.get("cache") else
+                 " No pre-compiled cache is bundled for this platform; "
+                 "the toolchain compiles shards live during your first "
+                 "play sessions instead (a small one-time cost per new "
+                 "area).")
+        ov = ("\n## Runtime-loaded code (native overlay shards)\n\n"
+              "This game loads part of its code from the disc while it "
+              "runs. The package includes `overlay_toolchain/` - the "
+              "self-contained compiler bundle the runtime uses to turn "
+              "that code into native PC code instead of interpreting "
+              "it (interpreting it was the stutter in earlier builds)."
+              + cache
+              + " Keep the `overlay_toolchain/` and `cache/` folders "
+                "next to the program; without them the game still "
+                "runs, but runtime-loaded code falls back to the slow "
+                "interpreter.\n")
     vk = ""
     if offer_vulkan and s.renderer != "vulkan":
         vk = ("\n## Renderer\n\n"
@@ -1089,7 +1645,7 @@ legally dumped disc image.
 
 Keyboard works out of the box. For controllers, connect them BEFORE
 launching, then use the launcher's PLAYER tabs.
-{swap}{ra}{vk}{ss}
+{swap}{ra}{vk}{ov}{ss}
 ## BIOS
 
 Uses the built-in OpenBIOS - no BIOS file needed.
@@ -1140,16 +1696,20 @@ def stage_package(r, job):
         targets.append(("linux", repo / "build-release", name))
     if s.build_windows:
         targets.append(("windows", repo / "build-windows", name + ".exe"))
+    # Assemble every target's folder first: overlay staging (below)
+    # runs the Linux package and its verdict decides what BOTH
+    # packages carry, and the README - written after - reports it.
+    stages = {}
     for osname, bdir, exefile in targets:
         stage = repo / f"pkg-{osname}" / name
         if stage.parent.exists():
             shutil.rmtree(stage.parent)
         stage.mkdir(parents=True)
+        stages[osname] = stage
         shutil.copy2(bdir / exefile, stage / exefile)
         offer = bool(job.vulkan_backend.get(osname))
         (stage / "game.toml").write_text(package_game_toml(job, offer))
         shutil.copy2(bdir / "game_options.toml", stage / "game_options.toml")
-        (stage / "README.md").write_text(package_readme(job, offer))
         shutil.copytree(bdir / "bios", stage / "bios")
         shutil.copytree(bdir / "assets", stage / "assets")
         # The game launcher shows cover art from artwork/<serial>/
@@ -1176,6 +1736,16 @@ def stage_package(r, job):
         if not s.save_states:
             (stage / "config.ini").write_text(
                 "[KeyMap]\nSaveStateMenu =\nRewind =\n")
+    # Overlay staging (v1.0.18): warm-run the Linux package with the
+    # framework toolchain staged; overlay games get the toolchain +
+    # a pre-warmed native shard cache in their packages, other games
+    # ship exactly as before.
+    job.overlay_info = stage_overlay(r, job, stages)
+    for osname, bdir, exefile in targets:
+        stage = stages[osname]
+        offer = bool(job.vulkan_backend.get(osname))
+        (stage / "README.md").write_text(
+            package_readme(job, offer, job.overlay_info.get(osname)))
         zip_path = job.root / f"{name}-{osname.capitalize()}.zip"
         if zip_path.exists():
             zip_path.unlink()
