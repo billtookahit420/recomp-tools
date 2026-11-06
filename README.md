@@ -41,6 +41,56 @@ UI and RetroAchievements wired in.
 - **OpenBIOS** — the open-source BIOS bundled with PSXRecomp.
 - Cover art: [libretro-thumbnails](https://thumbnails.libretro.com/).
 
+## Fixed — before & after
+
+Two runtime defects found in converted games are fixed in the engine,
+with the frames to show it. Both fixes are framework patches the
+engine applies to every new conversion; re-running an affected game
+under the listed release picks the fix up.
+
+### Tomb Raider 1 + 2 — black screen at level load (fixed in v1.0.16)
+
+The runtime's CD GetlocP answer reported the wrong track position, so
+both games waited forever at the load after a music-track seek:
+permanent black screen, no audio. Left: the frame every TR1 load
+landed on before the fix. Right: the same New Game load reaching the
+Caves after it.
+
+![Tomb Raider 1 — before: permanent black screen; after: Caves gameplay](docs/fixes/tr1-before-after.png)
+
+![Tomb Raider 1 — after: the Caves loading screen completes](docs/fixes/tr1-caves-loading.png)
+
+No pre-fix frame of Tomb Raider 2 was kept; it had the same defect
+and got the same fix. Below is TR2 after the fix — the Great Wall
+loading screen was its freeze point — plus the attract demo playing.
+
+![Tomb Raider 2 — after: the Great Wall loading screen completes, and Lara in the level](docs/fixes/tr2-after.png)
+
+![Tomb Raider 2 — after: attract demo (Bartoli's Hideout)](docs/fixes/tr2-bartoli-demo.png)
+
+### Resident Evil: Director's Cut — cropped FMVs (fixed in v1.0.17)
+
+Capcom's movie player uploads each frame as narrow vertical strips,
+which the runtime's movie staging didn't count, so movies rendered
+639 px wide in the 960-px window with the right third black. The
+pair below is the live-action intro before and after — different
+moments of the same movie; the width is the point.
+
+![Resident Evil: Director's Cut — FMV before: 639 px wide; after: full 960 px](docs/fixes/redc-before-after.png)
+
+![Resident Evil: Director's Cut — after: mansion hall gameplay](docs/fixes/redc-mansion-gameplay.png)
+
+### Mega Man 8 — same FMV crop (fixed in v1.0.17)
+
+Mega Man 8 uses the same Capcom strip-upload pattern and is cured by
+the same patch. No pre-fix frame of this game was kept, so only the
+after is shown: the opening FMV at full width, and intro-stage
+gameplay, from the v1.0.17 build.
+
+![Mega Man 8 — after: opening FMV at full width](docs/fixes/mm8-after.png)
+
+![Mega Man 8 — after: intro-stage gameplay](docs/fixes/mm8-gameplay.png)
+
 ## Changes
 
 - **v1.0.17 (2026-11-05)** — FMV crop fix: the runtime's depth24
