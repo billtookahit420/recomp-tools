@@ -43,6 +43,34 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.19 (2026-11-06)** — Doom / Final Doom wall & floor
+  striping fix (software + OpenGL renderers): at internal
+  resolution above 1x, textured walls and floors in Doom-engine
+  games showed dense vertical striping (worst at distance), and
+  hairline dark seams could appear along wall/floor joins. The
+  cause was coverage, not texture filtering: these engines build
+  the world from one-guest-pixel-thin textured triangles, and the
+  hi-res rasterizer covered the scaled geometry inexactly,
+  leaving sub-pixel slivers claimed by the wrong surface or
+  none. The fix makes both renderers decide coverage on the
+  guest pixel grid — the same biased edge rule the native
+  renderer uses — so abutting strips tile with no gaps and no
+  double-claims at any internal scale, while texture sampling
+  inside each guest pixel stays at full internal resolution
+  (no blur, no geometry changes). The OpenGL backend runs the
+  same ownership test in its fragment shader; its edge math was
+  fuzz-verified bit-exact against the native rule over 115M
+  pixels, zero mismatches. Verified on camera in Final Doom:
+  stripe-period modulation at 4x internal fell from 19.8% to
+  0.67% (software renderer) and from 14.2% to 0.33% (OpenGL);
+  coverage-visualization split guest pixels in wall interiors
+  fell from ~52–89% to 0.0% (software) and 51–57% to 0.3–1.2%
+  (OpenGL). Per-renderer status, honestly: the VULKAN renderer
+  does not have this fix yet (separate pipeline) — for Doom and
+  Final Doom, choose the Software or OpenGL renderer, not
+  Vulkan. Re-run Doom / Final Doom (or any game) under v1.0.19
+  to pick the fix up.
+
 - **v1.0.18 (2026-11-06)** — Runtime-loaded code (overlay) fix:
   many games load part of their code from the disc while they
   run, and in every package built so far that code was stuck in
