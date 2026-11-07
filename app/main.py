@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
@@ -116,6 +116,32 @@ resolution. Verified on Final Doom: stripe modulation
 19.8% -> 0.7% at 4x (Software), 14.2% -> 0.33% at 4x (OpenGL).
 The Vulkan renderer does not have this fix yet - for
 Doom-engine games, use the Software or OpenGL renderer.
+
+GAMES WHOSE TITLES START WITH A DIGIT "FAILED" AT THE FINISH
+LINE (FIXED IN v1.0.20)
+Games whose titles start with a digit (007 Racing, 007 The
+World Is Not Enough, 007 Tomorrow Never Dies) converted
+completely - full compile, working game - then reported
+failure at the last step: the framework named the finished
+program with a leading underscore (_007Racing) while the tool
+checked for the plain name. Builds made with v1.0.20 or later
+pin the program name explicitly, so digit-leading titles
+finish, verify and package under their real names.
+Letter-leading titles are unchanged. Re-run an affected game
+here to convert it cleanly.
+
+TITLE SCREEN CUT OFF AT THE RIGHT (FIXED IN v1.0.20)
+A few games show one static 24-bit screen - Gran Turismo's
+640x480 title screen is the known case - with the right side
+cut off (about 80 px black), while menus and gameplay render
+full width. The framework's 24-bit coverage counter discarded
+uploads that landed in the short present-hold after a display
+change, and the change itself zeroed the count, so a picture
+uploaded once and never again stayed partly uncounted and the
+presenter blanked the rest. Builds made with v1.0.20 or later
+count every upload, and the next upload starts the new
+picture's count instead of the change zeroing it. Re-run an
+affected game here to fix its package.
 
 GAMES THAT STUTTER ON RUNTIME-LOADED CODE (IMPROVED IN v1.0.18)
 Some games load part of their code from the disc while they run
@@ -237,26 +263,49 @@ class Worker(QThread):
         self.work_dir = work_dir
 
     def run(self):
-        for idx, item in enumerate(self.items):
-            self.item_status.emit(idx, "running")
-            job = engine.Job(cues=item["cues"], name=item["name"],
-                             title=item["title"].split(" (")[0],
-                             work_dir=self.work_dir,
-                             settings=self.settings,
-                             slug_override=item.get("slug", ""),
-                             art=item.get("art", ""))
-            try:
-                engine.run_job(job, self.log_line.emit)
-                self.item_status.emit(idx, "done")
-            except engine.StageError as ex:
-                msg = str(ex)
-                self.log_line.emit(f"FAILED: {msg}")
-                self.item_status.emit(
-                    idx, "needs review" if "needs review" in msg else "failed")
-            except Exception:
-                self.log_line.emit(traceback.format_exc())
-                self.item_status.emit(idx, "failed")
-        self.finished_all.emit()
+        # finished_all fires from a finally: whatever happens to an
+        # item - including an error building its Job, which used to
+        # sit OUTSIDE the try and kill this thread silently, leaving
+        # the queue frozen mid-list - the GUI is always told the run
+        # ended, and every item reaches a terminal status.
+        try:
+            for idx, item in enumerate(self.items):
+                self.item_status.emit(idx, "running")
+                try:
+                    job = engine.Job(cues=item["cues"], name=item["name"],
+                                     title=item["title"].split(" (")[0],
+                                     work_dir=self.work_dir,
+                                     settings=self.settings,
+                                     slug_override=item.get("slug", ""),
+                                     art=item.get("art", ""))
+                    engine.run_job(job, self.log_line.emit)
+                except engine.StageError as ex:
+                    msg = str(ex)
+                    self.log_line.emit(f"FAILED: {msg}")
+                    self.item_status.emit(
+                        idx, "needs review" if "needs review" in msg
+                        else "failed")
+                    continue
+                except Exception:
+                    self.log_line.emit(traceback.format_exc())
+                    self.item_status.emit(idx, "failed")
+                    continue
+                # Ground-truth gate: run_job returning is not enough.
+                # 'done' requires the item's packages to exist on
+                # disk, complete and non-empty - a conversion that
+                # produced no package is a failed conversion, never
+                # a done one.
+                if engine.job_packages_complete(job):
+                    self.item_status.emit(idx, "done")
+                else:
+                    self.log_line.emit(
+                        "FAILED: conversion ended but its package is "
+                        "missing or empty (checked: "
+                        + ", ".join(str(p) for p
+                                    in engine.package_paths(job)) + ")")
+                    self.item_status.emit(idx, "failed")
+        finally:
+            self.finished_all.emit()
 
 
 class InstallWorker(QThread):
@@ -333,7 +382,13 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.probe_worker = None
         self._probe_pending = []      # rows waiting for an auto-probe
+        self._run_active = False      # a conversion Worker is running
+        self._status_override = False  # disk reconcile may set 'done'
+        self._log_buf = []            # log lines awaiting a batched paint
         self._build_ui()
+        self._log_timer = QTimer(self)
+        self._log_timer.setInterval(120)
+        self._log_timer.timeout.connect(self._flush_log)
         self._load_settings()
         self.refresh_toolbox()
 
@@ -500,7 +555,24 @@ class MainWindow(QMainWindow):
             edit.setText(p)
 
     def log_line(self, msg):
-        self.log.appendPlainText(str(msg))
+        # Log lines arrive one queued signal per child output line -
+        # a single compile streams thousands. Painting each one
+        # individually lets the GUI thread fall far behind the
+        # worker in long sessions, and the queue's status updates
+        # wait in the same event queue behind the flood. Buffer and
+        # paint in batches instead: the pane stays near-real-time
+        # (120 ms) at a fraction of the layout cost. Display only -
+        # conversion never reads the log widget.
+        self._log_buf.append(str(msg))
+        if not self._log_timer.isActive():
+            self._log_timer.start()
+
+    def _flush_log(self):
+        if not self._log_buf:
+            self._log_timer.stop()
+            return
+        buf, self._log_buf = self._log_buf, []
+        self.log.appendPlainText("\n".join(buf))
 
     def refresh_toolbox(self):
         state = engine.toolbox_check()
@@ -608,9 +680,19 @@ class MainWindow(QMainWindow):
         # Auto-group: however the discs are added - one at a time or
         # all at once - discs of the same set land in ONE queue item.
         key = self._set_key(cues)
+        if self._run_active and any(
+                self._set_key(it["cues"]) == key for it in self.items):
+            # Grouping into an existing row rewrites that item's cue
+            # list and status; mid-run that item may be the one the
+            # worker is converting right now. Appending a NEW set is
+            # fine during a run - merging into a live one is not.
+            self.log_line("Add deferred: that disc set is already in "
+                          "the queue and a conversion run is in "
+                          "progress - add its discs again after the "
+                          "run finishes.")
+            return
         for row, item in enumerate(self.items):
-            cell = self.table.item(row, 5)
-            if cell and cell.text() in ("done", "running"):
+            if item.get("state") in ("done", "running"):
                 continue
             if self._set_key(item["cues"]) != key:
                 continue
@@ -638,9 +720,42 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self._fill_row(row, item, "queued")
+        self._reconcile_done()       # already converted? say so now
         self._queue_probe(row)        # auto-probe every added disc/set
 
+    # ------------------------------------------------------------ status
+    #
+    # A row's status has ONE writer (this class, on the GUI thread)
+    # and a monotonic lifecycle: queued -> (probe states) -> running
+    # -> terminal (done / failed / needs review). _apply_status is
+    # the gate every write passes through, and it refuses backward
+    # moves - so a late probe completion can no longer paint
+    # 'probed' over a finished game, and nothing can repaint a
+    # running or finished row as 'queued'. The two deliberate
+    # exceptions: run_queue starts a NEW lifecycle for the items it
+    # is about to run (it resets their state itself, below), and
+    # _reconcile_done may set 'done' from disk ground truth (the
+    # _status_override flag) - disk outranks session memory.
+
+    _TERMINAL = ("done", "failed", "needs review")
+    _PRE_RUN = ("queued", "probing", "probed", "probe failed")
+
+    def _apply_status(self, item, status):
+        cur = item.get("state", "queued")
+        if status == cur:
+            return cur
+        if cur in self._TERMINAL:
+            if status == "done" and self._status_override:
+                item["state"] = "done"
+                return "done"
+            return cur
+        if cur == "running" and status not in self._TERMINAL:
+            return cur
+        item["state"] = status
+        return status
+
     def _fill_row(self, row, item, status):
+        status = self._apply_status(item, status)
         probe = item["probes"][0] if item["probes"] else {}
         vals = [item["title"], probe.get("serial", "?"),
                 str(self.players_spin.value() or "?"),
@@ -663,6 +778,14 @@ class MainWindow(QMainWindow):
             self._add_item(sorted(ps))
 
     def remove_selected(self):
+        if self._run_active:
+            # Removing a row mid-run shifts every row below it; the
+            # running worker's remaining items would no longer line
+            # up with the rows their statuses belong on.
+            self.log_line("Remove ignored while a conversion run is "
+                          "in progress - removing a row mid-run "
+                          "would misalign the queue's bookkeeping.")
+            return
         rows = sorted({i.row() for i in self.table.selectedIndexes()},
                       reverse=True)
         for row in rows:
@@ -712,6 +835,7 @@ class MainWindow(QMainWindow):
                 item["probes"][0].get("display_name") or item["title"])
         self._fill_row(row, item, "probed")
         self.show_selected()
+        self._reconcile_done()       # the name may have just changed
         self._probe_next()
 
     def _probe_next(self):
@@ -745,33 +869,110 @@ class MainWindow(QMainWindow):
             lines.append(f"Set verdict: {json.dumps(item['verdict'])[:200]}")
         self.probe_label.setText("\n".join(lines))
 
+    def _reconcile_done(self):
+        """Ground truth from DISK: a queue item whose requested
+        packages already exist - complete and non-empty - in the
+        output folder IS done, whatever this session's table says.
+        Runs when an item is added, when its probe lands (the probe
+        can change the game's name, hence its package names), and
+        before every queue run - so a restarted app, or a session
+        whose display fell behind the work, heals from the folder
+        instead of re-converting finished games. Never touches a
+        row that is running right now."""
+        if not self.items:
+            return
+        settings = self.current_settings()
+        work_dir = self.out_edit.text().strip()
+        self._status_override = True
+        try:
+            for row, item in enumerate(self.items):
+                if item.get("state") == "running":
+                    continue
+                try:
+                    job = engine.Job(cues=item["cues"], name=item["name"],
+                                     title=item["title"].split(" (")[0],
+                                     work_dir=work_dir, settings=settings,
+                                     slug_override=item.get("slug", ""),
+                                     art=item.get("art", ""))
+                    complete = engine.job_packages_complete(job)
+                except Exception:
+                    # A malformed item or an odd output folder must
+                    # never break the queue - it just isn't done.
+                    complete = False
+                    job = None
+                if complete:
+                    if item.get("state") != "done":
+                        paths = engine.package_paths(job)
+                        self.log_line(
+                            "already converted (package on disk): "
+                            + (str(paths[0]) if paths
+                               else item.get("title", "?")))
+                    self._fill_row(row, item, "done")
+        finally:
+            self._status_override = False
+
+    def _worker_status(self, todo_items, idx, status):
+        """Deliver a worker status to its row. The row is resolved
+        by ITEM IDENTITY at delivery time - never by a row number
+        captured when the run started: rows are the display's
+        business, items are the truth, and a captured row map is
+        how statuses used to land on the wrong games. A status for
+        an item that has left the queue goes nowhere."""
+        if not (0 <= idx < len(todo_items)):
+            return
+        item = todo_items[idx]
+        row = next((r for r, it in enumerate(self.items)
+                    if it is item), None)
+        if row is None or row >= self.table.rowCount():
+            return
+        self._fill_row(row, item, status)
+
+    def _queue_finished(self):
+        if self._run_active:
+            self._run_active = False
+            self.log_line("=== QUEUE FINISHED ===")
+            self._flush_log()
+
     def run_queue(self):
-        if self.worker and self.worker.isRunning():
+        if self._run_active or (self.worker is not None
+                                and self.worker.isRunning()):
+            # A hard no-op, and it says so: two workers over one
+            # queue would interleave their status writes over the
+            # same rows - the scrambled-table failure class.
+            self.log_line("Run Queue ignored: a conversion run is "
+                          "already in progress (games convert one "
+                          "at a time; a second run cannot start "
+                          "until this one finishes).")
             return
         if not self.items:
             QMessageBox.information(self, "Run Queue", "The queue is empty.")
             return
         self._save_settings()
-        todo = []
-        for row, item in enumerate(self.items):
-            status = self.table.item(row, 5)
-            if status and status.text() in ("done",):
-                continue
-            todo.append((row, item))
+        self._reconcile_done()
+        todo = [(row, item) for row, item in enumerate(self.items)
+                if item.get("state") != "done"]
         if not todo:
             QMessageBox.information(self, "Run Queue", "Everything is done.")
             return
-        self.worker = Worker([it for _, it in todo],
+        todo_items = [it for _, it in todo]
+        self.worker = Worker(todo_items,
                              self.current_settings(),
                              self.out_edit.text().strip())
-        row_map = {i: row for i, (row, _) in enumerate(todo)}
         self.worker.log_line.connect(self.log_line)
         self.worker.item_status.connect(
-            lambda i, s: self._fill_row(row_map[i], self.items[row_map[i]], s))
-        self.worker.finished_all.connect(
-            lambda: self.log_line("=== QUEUE FINISHED ==="))
-        for row, _ in todo:
-            self._fill_row(row, self.items[row], "queued")
+            lambda i, s: self._worker_status(todo_items, i, s))
+        self.worker.finished_all.connect(self._queue_finished)
+        # Backstop: QThread.finished fires even if run() dies early.
+        self.worker.finished.connect(self._queue_finished)
+        # A new run starts a NEW status lifecycle for its items -
+        # this reset (and the disk reconcile above) is the one
+        # deliberate exception to the monotonic lifecycle, and it
+        # happens here, on the GUI thread, before the worker starts.
+        for item in todo_items:
+            item["state"] = "queued"
+        for row, item in todo:
+            self._fill_row(row, item, "queued")
+        self._run_active = True
         self.worker.start()
         self.log_line("=== QUEUE STARTED (one game at a time) ===")
 

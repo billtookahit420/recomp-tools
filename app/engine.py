@@ -22,8 +22,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -116,9 +118,14 @@ def ensure_framework_cache(log):
         if dst.is_dir() and any(dst.iterdir()):
             continue
         log(f"downloading framework: {url}")
-        res = subprocess.run(["git", "clone", "--depth", "1",
-                              "--recurse-submodules", url,
-                              str(dst)], capture_output=True, text=True)
+        try:
+            res = subprocess.run(["git", "clone", "--depth", "1",
+                                  "--recurse-submodules", url,
+                                  str(dst)], capture_output=True,
+                                 text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            log("framework clone timed out after 1800s: " + url)
+            return None
         if res.returncode != 0:
             log("clone failed: " + (res.stderr or "")[-300:])
             return None
@@ -161,16 +168,40 @@ class Runner:
             p = subprocess.Popen(cmd, cwd=cwd, env=e,
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True,
-                                 errors="replace", bufsize=1)
+                                 errors="replace", bufsize=1,
+                                 start_new_session=True)
         except FileNotFoundError as ex:
             raise StageError(f"tool not found: {cmd[0]} ({ex})")
+        # The deadline is enforced against the PROCESS, not the
+        # output stream. The old loop read p.stdout to EOF and only
+        # then called p.wait(timeout=...): a child that prints
+        # nothing while it spins - or a dead child whose grandchild
+        # inherited the pipe - kept the stream open forever and the
+        # timeout could never fire (the GB-family silent-child
+        # defect, fixed there in v1.0.1; this engine had the same
+        # shape and was not in that audit). Output is now drained
+        # on a thread; on timeout the child's whole process group
+        # is killed, so nothing outlives the deadline.
+        def _drain():
+            try:
+                for line in p.stdout:
+                    self.log(line.rstrip("\n"))
+            except (ValueError, OSError):
+                pass
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
         try:
-            for line in p.stdout:
-                self.log(line.rstrip("\n"))
             rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            p.kill()
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                p.kill()
+            p.wait()
+            reader.join(timeout=5)
             raise StageError(f"timed out after {timeout}s: {cmd[0]}")
+        reader.join(timeout=5)
         self.log(f"-> exit {rc}")
         return rc
 
@@ -261,7 +292,7 @@ class Job:
 
 # ---------------------------------------------------------------- probing
 
-def patch_probe_subdir_boot(template, log=print):
+def patch_probe_subdir_boot(template, log=print, fail_loud=False):
     """Teach the framework probe to follow SYSTEM.CNF boot paths that
     point INTO a subdirectory (Tekken 3: BOOT = cdrom:\\TEKKEN3\\SLUS_004.02;1
     — the stock probe only searches the root directory and fails those
@@ -271,6 +302,10 @@ def patch_probe_subdir_boot(template, log=print):
         probe = Path(template) / "psxrecomp" / "tools" / \
             "new_project_layout" / "probe_disc.py"
         if not probe.exists():
+            if fail_loud:
+                raise StageError(
+                    f"probe_disc.py missing under {template} - cannot "
+                    f"apply the subdirectory-boot probe patch")
             return
         text = probe.read_text()
         if "boot_path_components" in text:
@@ -292,6 +327,16 @@ def boot_path_components(cnf: bytes) -> list[str]:
 '''
         anchor = "\ndef normalize_serial("
         if anchor not in text:
+            if fail_loud:
+                raise StageError(
+                    f"probe_disc.py in {template} does NOT take the "
+                    f"subdirectory-boot patch: insertion anchor "
+                    f"'def normalize_serial(' not found - this probe "
+                    f"variant is not covered by this tool version, and "
+                    f"discs whose SYSTEM.CNF boot path points into a "
+                    f"subdirectory (e.g. Tekken 3) would be probed "
+                    f"wrong. Failing the job instead of shipping it "
+                    f"broken; update the tool or the template.")
             return
         text = text.replace(anchor, helper + "def normalize_serial(", 1)
         old_raise = """            else:
@@ -334,15 +379,31 @@ def boot_path_components(cnf: bytes) -> list[str]:
                     )
 """
         if old_raise not in text:
+            if fail_loud:
+                raise StageError(
+                    f"probe_disc.py in {template} does NOT take the "
+                    f"subdirectory-boot patch: the stock 'boot EXE not "
+                    f"on disc' raise was not found - this probe variant "
+                    f"is not covered by this tool version, and discs "
+                    f"whose SYSTEM.CNF boot path points into a "
+                    f"subdirectory (e.g. Tekken 3) would be probed "
+                    f"wrong. Failing the job instead of shipping it "
+                    f"broken; update the tool or the template.")
             return
         text = text.replace(old_raise, new_raise, 1)
         probe.write_text(text)
         log("patched probe_disc.py: subdirectory boot paths (Tekken 3)")
+    except StageError:
+        raise
     except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"subdirectory-boot probe patch failed on "
+                f"{template}: {e}") from e
         log(f"probe subdir patch skipped: {e}")
 
 
-def patch_overlay_draw_chain(template, log=print):
+def patch_overlay_draw_chain(template, log=print, fail_loud=False):
     """Let the in-game menu and the RetroAchievements pop-ups share the
     host overlay draw slot. Upstream host_overlay.c keeps ONE draw
     callback: the menu provider registers at session setup, the RA module
@@ -357,6 +418,10 @@ def patch_overlay_draw_chain(template, log=print):
         src = Path(template) / "psxrecomp" / "runtime" / "src" / \
             "host_overlay.c"
         if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"host_overlay.c missing under {template} - "
+                    f"cannot apply the overlay draw-chain patch")
             return
         text = src.read_text()
         if "PSX_HOST_OVERLAY_DRAW_MAX" in text:
@@ -364,19 +429,35 @@ def patch_overlay_draw_chain(template, log=print):
         start = "/* ---- P2: overlay draw callback"
         end = "/* ---- Game HUD layer"
         if start not in text or end not in text:
+            if fail_loud:
+                raise StageError(
+                    f"host_overlay.c in {template} does NOT take the "
+                    f"overlay draw-chain patch: section anchors not "
+                    f"found - this runtime variant is not covered by "
+                    f"this tool version, and the game would ship with "
+                    f"the in-game menu opening invisibly while "
+                    f"RetroAchievements pop-ups replace its draw. "
+                    f"Failing the job instead of shipping it broken; "
+                    f"update the tool or the template.")
             return
         i = text.index(start)
         j = text.index(end)
         text = text[:i] + OVERLAY_DRAW_CHAIN_SPAN + text[j:]
         src.write_text(text)
         log("patched host_overlay.c: menu + RA share the overlay draw")
+    except StageError:
+        raise
     except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"overlay draw-chain patch failed on {template}: "
+                f"{e}") from e
         log(f"overlay draw-chain patch skipped: {e}")
 
 
 OVERLAY_DRAW_CHAIN_SPAN = "/* ---- P2: overlay draw callback -------------------------------------------- */\n/* Registered on the main thread, read on the render / present thread. The\n * function and its context are published together as one immutable record\n * behind an atomic pointer, so a reader never pairs a live function with a\n * stale context.\n *\n * Lifetime: every call runs inside an in-flight count. Replacing or removing\n * the callback swaps the record and then waits until no call that could have\n * read the old record is still running, so when psx_host_overlay_set_draw_cb\n * returns, the previous fn will not run again and its ctx (and the GL objects\n * it draws with) may be freed by the caller. The old record is freed there\n * too. A change made from inside the callback itself does not wait (it would\n * wait for itself); that caller's own frame is the only one still using the\n * old ctx and it returns before the next frame reads the new record. */\n/* Up to two draw consumers share this layer: the in-game menu provider\n * registers first (at session setup) and feature overlays such as the\n * RetroAchievements pop-ups register afterwards. A one-callback record let\n * the later registration silently replace the menu's draw, leaving an open\n * but invisible menu, so the record now keeps both, keyed by function\n * pointer. Entries draw last-registered first, so the first registrant\n * (the menu) paints on top. A NULL fn keeps its historic meaning: the\n * caller is tearing the layer down and every entry is removed. */\n#define PSX_HOST_OVERLAY_DRAW_MAX 2\ntypedef struct {\n    PsxHostOverlayDrawFn fn;\n    void *ctx;\n} PsxHostOverlayDrawEntry;\ntypedef struct {\n    PsxHostOverlayDrawEntry entries[PSX_HOST_OVERLAY_DRAW_MAX];\n    int count;\n} PsxHostOverlayDraw;\n\nstatic _Atomic(PsxHostOverlayDraw *) s_draw = NULL;\nstatic atomic_flag s_draw_set_lock = ATOMIC_FLAG_INIT;\nstatic atomic_int s_draw_inflight = 0;\n#if defined(_MSC_VER)\nstatic __declspec(thread) int s_in_draw = 0;\n#else\nstatic _Thread_local int s_in_draw = 0;\n#endif\n\nstatic void draw_yield(void) {\n#if defined(_WIN32)\n    Sleep(0);\n#else\n    sched_yield();\n#endif\n}\n\nvoid psx_host_overlay_set_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {\n    PsxHostOverlayDraw *rec = NULL, *old;\n    /* Compose the successor from the current record under a lock so two\n     * registering threads cannot lose each other's entry. Readers never\n     * take this lock, so composing cannot deadlock a draw in flight; the\n     * in-flight wait + free below keep the lifetime contract above. */\n    while (atomic_flag_test_and_set(&s_draw_set_lock)) draw_yield();\n    old = atomic_load(&s_draw);\n    if (fn) {\n        int found = -1;\n        rec = (PsxHostOverlayDraw *)malloc(sizeof(*rec));\n        if (!rec) {\n            atomic_flag_clear(&s_draw_set_lock);\n            return;\n        }\n        rec->count = 0;\n        if (old) {\n            for (int i = 0; i < old->count; ++i) {\n                if (old->entries[i].fn == fn) found = rec->count;\n                rec->entries[rec->count++] = old->entries[i];\n            }\n        }\n        if (found >= 0) {\n            rec->entries[found].ctx = ctx; /* re-registering keeps its slot */\n        } else {\n            if (rec->count >= PSX_HOST_OVERLAY_DRAW_MAX)\n                rec->count = PSX_HOST_OVERLAY_DRAW_MAX - 1; /* evict newest other */\n            rec->entries[rec->count].fn = fn;\n            rec->entries[rec->count].ctx = ctx;\n            rec->count++;\n        }\n    }\n    atomic_store(&s_draw, rec); /* seq_cst: ordered with the readers' count */\n    atomic_flag_clear(&s_draw_set_lock);\n    if (s_in_draw) return; /* from inside the callback: see above; old stays (rare) */\n    while (atomic_load(&s_draw_inflight) > 0) draw_yield();\n    free(old);\n}\n\nint psx_host_overlay_has_draw(void) {\n    return atomic_load_explicit(&s_draw, memory_order_acquire) != NULL;\n}\n\nvoid psx_host_overlay_draw(int width, int height) {\n    PsxHostOverlayDraw *rec;\n    if (width <= 0 || height <= 0) return;\n    atomic_fetch_add(&s_draw_inflight, 1); /* seq_cst, before reading the record */\n    rec = atomic_load(&s_draw);\n    if (rec) {\n        s_in_draw = 1;\n        for (int i = rec->count - 1; i >= 0; --i)\n            if (rec->entries[i].fn)\n                rec->entries[i].fn(width, height, rec->entries[i].ctx);\n        s_in_draw = 0;\n    }\n    atomic_fetch_sub(&s_draw_inflight, 1);\n}\n\n"
 
-def patch_cdrom_getlocp(template, log=print):
+def patch_cdrom_getlocp(template, log=print, fail_loud=False):
     """Fix the runtime's CD GetlocP answer for positions inside a CD-DA
     track. Upstream cdrom.c's not-playing branch hardcoded track 1 /
     track_lba 0, so after a SeekP into a music track the sub-Q answer
@@ -396,6 +477,10 @@ def patch_cdrom_getlocp(template, log=print):
         src = Path(template) / "psxrecomp" / "runtime" / "src" / \
             "cdrom.c"
         if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"cdrom.c missing under {template} - cannot "
+                    f"apply the GetlocP patch")
             return
         text = src.read_text()
         if "cdda_track_for_lba((uint32_t)lba)" in text:
@@ -434,6 +519,16 @@ def patch_cdrom_getlocp(template, log=print):
         new_c = """            response_push(bin_to_bcd(track));
             response_push(bin_to_bcd(index));"""
         if old_a not in text or old_b not in text or old_c not in text:
+            if fail_loud:
+                raise StageError(
+                    f"cdrom.c in {template} does NOT take the "
+                    f"GetlocP patch: anchors not found - this runtime "
+                    f"variant is not covered by this tool version, "
+                    f"and games that poll GetlocP to confirm a seek "
+                    f"into a CD music track (Tomb Raider 1/2) would "
+                    f"ship hanging on a black screen. Failing the "
+                    f"job instead of shipping it broken; update the "
+                    f"tool or the template.")
             return
         text = text.replace(old_a, new_a, 1)
         text = text.replace(old_b, new_b, 1)
@@ -441,7 +536,13 @@ def patch_cdrom_getlocp(template, log=print):
         src.write_text(text)
         log("patched cdrom.c: GetlocP reports the real track + pregap "
             "sub-Q (Tomb Raider 1/2 black-screen fix)")
+    except StageError:
+        raise
     except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"cdrom GetlocP patch failed on {template}: "
+                f"{e}") from e
         log(f"cdrom GetlocP patch skipped: {e}")
 
 
@@ -452,7 +553,7 @@ GPU_DEPTH24_NEW_A = '/* Depth24: note/query/reset the CPU→VRAM upload span tra
 GPU_DEPTH24_OLD_B = '    if (rows == 0u || w < 8u || margin == 0u || margin >= w)\n        return rows;\n    uint32_t start = w - margin;\n    uint32_t lim = gpu_depth24_rgb_limit(di->display_x, w);\n    if (lim > 0u && lim < w && lim < start)\n        start = lim;\n'
 
 GPU_DEPTH24_NEW_B = "    if (rows == 0u || w < 8u)\n        return rows;\n    uint32_t lim = gpu_depth24_rgb_limit(di->display_x, w);\n    uint32_t start;\n    if (lim >= w) {\n        /* The guest's uploads cover the full CRTC width: no column is\n         * stale, so blank nothing. (Previously the margin fallback still\n         * clipped the last `margin` real columns of a fully covered\n         * frame — RE: Director's Cut's movies lost their right 8 px.) */\n        return rows;\n    } else if (lim > 0u) {\n        /* Blank exactly the uncovered tail past the covered span. */\n        start = lim;\n    } else {\n        /* No coverage information yet: legacy margin-only blanking. */\n        if (margin == 0u || margin >= w)\n            return rows;\n        start = w - margin;\n    }\n"
-def patch_gpu_depth24_span(template, log=print):
+def patch_gpu_depth24_span(template, log=print, fail_loud=False):
     """Fix the runtime's depth24 (24-bit movie) upload-span tracker.
     Upstream gpu.c's tracker only counted CPU->VRAM uploads at least
     256 halfwords wide ("FB-class"), but real STR players upload each
@@ -478,11 +579,25 @@ def patch_gpu_depth24_span(template, log=print):
         src = Path(template) / "psxrecomp" / "runtime" / "src" / \
             "gpu.c"
         if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"gpu.c missing under {template} - cannot "
+                    f"apply the depth24 span patch")
             return
         text = src.read_text()
         if "Every A0 counts, whatever its width" in text:
             return
         if GPU_DEPTH24_OLD_A not in text or GPU_DEPTH24_OLD_B not in text:
+            if fail_loud:
+                raise StageError(
+                    f"gpu.c in {template} does NOT take the depth24 "
+                    f"span patch: anchors not found - this runtime "
+                    f"variant is not covered by this tool version, "
+                    f"and 24-bit movies uploaded as narrow strips "
+                    f"(Resident Evil: Director's Cut, Mega Man 8) "
+                    f"would ship cropped. Failing the job instead "
+                    f"of shipping it broken; update the tool or the "
+                    f"template.")
             return
         text = text.replace(GPU_DEPTH24_OLD_A, GPU_DEPTH24_NEW_A, 1)
         text = text.replace(GPU_DEPTH24_OLD_B, GPU_DEPTH24_NEW_B, 1)
@@ -490,7 +605,13 @@ def patch_gpu_depth24_span(template, log=print):
         log("patched gpu.c: depth24 span counts every upload; staging "
             "blanks only the uncovered tail (RE DC / Mega Man 8 FMV "
             "crop fix)")
+    except StageError:
+        raise
     except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"gpu depth24 span patch failed on {template}: "
+                f"{e}") from e
         log(f"gpu depth24 span patch skipped: {e}")
 
 
@@ -544,7 +665,111 @@ SW_GRID_OLD_11 = '    if (g_hr) {\n        int s = g_scale;\n        RTarget hr 
 
 SW_GRID_NEW_11 = '    if (g_hr) {\n        int s = g_scale;\n        RTarget hr = rt_hires();\n        if (grid_eligible(&hr)) {\n            const int rgb9[9] = { r0, g0, b0, r1, g1, b1, r2, g2, b2 };\n            GridTri gt;\n            grid_fill_textured(&gt, x0, y0, u0, v0, x1, y1, u1, v1,\n                               x2, y2, u2, v2, clut_x, clut_y, texpage,\n                               GG_SHADED_TEX, raw_texture, 0, rgb9);\n            grid_raster_triangle(&hr, &gt);\n        } else {\n            raster_shaded_textured_triangle(&hr,\n                precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,\n                precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,\n                precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,\n                clut_x, clut_y, texpage, raw_texture, g_perspective_valid,\n                g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);\n        }\n    }\n    if (g_wide_cur) {\n        int s = g_scale, dx = wide_dx();\n        RTarget wt = rt_wide();\n        WideBd bd = wide_bd_get();\n        if (!bd.on && grid_eligible(&wt)) {\n            const int rgb9[9] = { r0, g0, b0, r1, g1, b1, r2, g2, b2 };\n            GridTri gt;\n            grid_fill_textured(&gt, x0, y0, u0, v0, x1, y1, u1, v1,\n                               x2, y2, u2, v2, clut_x, clut_y, texpage,\n                               GG_SHADED_TEX, raw_texture, dx, rgb9);\n            grid_raster_triangle(&wt, &gt);\n        } else {\n            raster_shaded_textured_triangle(&wt,\n                precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,\n                precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,\n                precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,\n                clut_x, clut_y, texpage, raw_texture, g_perspective_valid,\n                g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);\n        }\n    }\n    precise_consumed();\n}\n'
 
-def patch_sw_guest_grid(template, log=print):
+D24HOLD_OLD_1 = "static uint32_t s_d24_upload_x1 = 0;\nstatic int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */\n"
+
+D24HOLD_NEW_1 = "static uint32_t s_d24_upload_x1 = 0;\n/* Set by a GP1(07h) band retarget while depth24: the span above still\n * describes the image in VRAM (a retarget moves no pixels), so it is\n * NOT discarded; the next depth24 upload restarts the span from its\n * own extent, because that commit is where a genuinely new image\n * begins. Consumed by depth24_note_upload. */\nstatic int      s_d24_span_restart_pending = 0;\nstatic int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */\n"
+
+D24HOLD_OLD_2 = "static void depth24_note_upload(uint32_t x, uint32_t w) {\n    if (!(display_depth & 1u)) return;\n    if (s_d24_present_hold > 0) return;\n    uint32_t x1 = x + w;\n    if (x1 > 1024u) x1 = 1024u;\n    if (x1 > s_d24_upload_x1) s_d24_upload_x1 = x1;\n}\n"
+
+D24HOLD_NEW_2 = "static void depth24_note_upload(uint32_t x, uint32_t w) {\n    if (!(display_depth & 1u)) return;\n    /* The present-hold gates PRESENTING only (it drives the Swap skip\n     * via s_d24_present_skip); it must never gate accounting. Commits\n     * landing inside the 3-vblank hold after a GP1(07h) retarget are\n     * real coverage of the image being built: dropping them, together\n     * with the retarget reset this replaces, under-counted a static\n     * once-uploaded depth24 image whose upload straddled the retarget\n     * - Gran Turismo's 640x480 title stopped at 840/960 halfwords on\n     * hardware timing and the staging blanked its right 80 RGB px for\n     * the whole session (post-title screens, uploaded after the last\n     * retarget, were unaffected). */\n    uint32_t x1 = x + w;\n    if (x1 > 1024u) x1 = 1024u;\n    if (s_d24_span_restart_pending) {\n        /* First commit after a band retarget: this is where the new\n         * image's coverage starts; the previous image's extent no\n         * longer describes what scanout will show. */\n        s_d24_span_restart_pending = 0;\n        s_d24_upload_x1 = x1;\n    } else if (x1 > s_d24_upload_x1) {\n        s_d24_upload_x1 = x1;\n    }\n}\n"
+
+D24HOLD_OLD_3 = "    if ((display_depth & 1u) && s_d24_prev_disp_h != 0u && h != s_d24_prev_disp_h) {\n        s_d24_upload_x1 = 0;\n        s_d24_present_hold = 3;\n    }\n"
+
+D24HOLD_NEW_3 = "    if ((display_depth & 1u) && s_d24_prev_disp_h != 0u && h != s_d24_prev_disp_h) {\n        /* Do NOT zero the span here: the retarget itself makes nothing\n         * in VRAM stale - the image on screen is still the one the\n         * guest uploaded, and for a static image (GT's title) no\n         * further upload ever re-extends a zeroed span, so the\n         * staging blanked real columns permanently. The hold below\n         * covers the flash window the reset was added for (MotK\n         * intro->crawl): presents skip Swap for 3 vblanks, and the\n         * first commit of the next image restarts the span via\n         * s_d24_span_restart_pending (see depth24_note_upload). */\n        s_d24_span_restart_pending = 1;\n        s_d24_present_hold = 3;\n    }\n"
+
+D24HOLD_OLD_4 = "void gpu_depth24_upload_span_reset(void) {\n    s_d24_upload_x1 = 0;\n}\n"
+
+D24HOLD_NEW_4 = "void gpu_depth24_upload_span_reset(void) {\n    s_d24_upload_x1 = 0;\n    s_d24_span_restart_pending = 0;\n}\n"
+
+D24HOLD_OLD_5 = "    s_d24_upload_x1 = 0;\n    s_d24_present_hold = 0;\n    s_d24_present_skip = 0;\n    s_d24_prev_disp_h = 0;\n"
+
+D24HOLD_NEW_5 = "    s_d24_upload_x1 = 0;\n    s_d24_span_restart_pending = 0;\n    s_d24_present_hold = 0;\n    s_d24_present_skip = 0;\n    s_d24_prev_disp_h = 0;\n"
+
+D24HOLD_OLD_6 = "    WU(s_d24_upload_x1); WI(s_d24_present_hold | 0x200 | (s_d24_present_skip ? 0x100 : 0));\n"
+
+D24HOLD_NEW_6 = "    WU(s_d24_upload_x1); WI(s_d24_present_hold | 0x200 | (s_d24_present_skip ? 0x100 : 0) | (s_d24_span_restart_pending ? 0x400 : 0));\n"
+
+D24HOLD_OLD_7 = "    s_d24_present_skip = (s_d24_present_hold & 0x200)\n        ? (s_d24_present_hold & 0x100) != 0\n        : (s_d24_present_hold & 0x100) || (s_d24_present_hold & 0xFF) > 0;\n    s_d24_present_hold &= 0xFF;\n"
+
+D24HOLD_NEW_7 = "    s_d24_present_skip = (s_d24_present_hold & 0x200)\n        ? (s_d24_present_hold & 0x100) != 0\n        : (s_d24_present_hold & 0x100) || (s_d24_present_hold & 0xFF) > 0;\n    /* Bit 10 (0x400): span-restart-pending, only meaningful in the\n     * 0x200 format; snaps without the marker predate the flag. */\n    s_d24_span_restart_pending = (s_d24_present_hold & 0x400) != 0;\n    s_d24_present_hold &= 0xFF;\n"
+
+def patch_gpu_depth24_hold(template, log=print, fail_loud=False):
+    """Fix the depth24 upload-span accounting around GP1(07h) band
+    retargets. Two accounting rules threw away real coverage: (1)
+    depth24_note_upload discarded every CPU->VRAM commit that landed
+    inside the 3-vblank present-hold after a retarget, although the
+    hold exists to gate PRESENTING (Swap skip), not accounting; and
+    (2) the retarget itself hard-reset the span to zero, discarding
+    coverage the guest had already delivered for the SAME image - a
+    streamed movie re-uploads and re-grows the span within a frame,
+    but a static once-uploaded image never does. Gran Turismo's
+    640x480 depth24 title screen was left with a counted span of
+    840/960 halfwords on hardware timing, so the depth24 staging
+    blanked its right 80 RGB px for the whole session (only the title
+    cropped; later screens upload after the last retarget). The patch
+    counts commits during the hold, and replaces the hard reset with
+    a restart-pending flag the next depth24 commit consumes (the new
+    image's coverage starts at its own first commit; the hold still
+    covers the stale-flash window the reset protected MotK against).
+    Depth toggles and depth24-exit resets stay hard resets. The flag
+    rides the GPU snapshot in bit 0x400 of the packed hold word, next
+    to the existing skip flag. Composes with patch_gpu_depth24_span
+    (v1.0.17): anchors are byte-identical before and after that patch,
+    and the span limit / staging logic are untouched.
+    Idempotent text patch on the template / framework cache and on
+    scaffolded projects (found 2026-11-07, GT title crop)."""
+    try:
+        src = Path(template) / "psxrecomp" / "runtime" / "src" / \
+            "gpu.c"
+        if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"gpu.c missing under {template} - cannot "
+                    f"apply the depth24 hold patch")
+            return
+        text = src.read_text()
+        if "s_d24_span_restart_pending" in text:
+            return
+        pairs = [(D24HOLD_OLD_1, D24HOLD_NEW_1),
+                 (D24HOLD_OLD_2, D24HOLD_NEW_2),
+                 (D24HOLD_OLD_3, D24HOLD_NEW_3),
+                 (D24HOLD_OLD_4, D24HOLD_NEW_4),
+                 (D24HOLD_OLD_5, D24HOLD_NEW_5),
+                 (D24HOLD_OLD_6, D24HOLD_NEW_6),
+                 (D24HOLD_OLD_7, D24HOLD_NEW_7)]
+        missing = [i for i, (old, _n) in enumerate(pairs)
+                   if old not in text]
+        if missing:
+            if fail_loud:
+                raise StageError(
+                    f"gpu.c in {template} does NOT take the "
+                    f"depth24 hold patch: {len(missing)} of "
+                    f"{len(pairs)} anchors missing {missing} - "
+                    f"this runtime variant is not covered by "
+                    f"this tool version, and static 24-bit "
+                    f"screens shown right after a display-band "
+                    f"change (Gran Turismo's title screen) would "
+                    f"ship with the right side cropped. Failing "
+                    f"the job instead of shipping it broken; "
+                    f"update the tool or the template.")
+            return
+        for old, new in pairs:
+            text = text.replace(old, new, 1)
+        src.write_text(text)
+        log("patched gpu.c: depth24 span counts commits during the "
+            "present-hold; GP1(07h) retarget defers the span reset to "
+            "the next upload (GT title-screen crop fix)")
+    except StageError:
+        raise
+    except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"gpu depth24 hold patch failed on {template}: "
+                f"{e}") from e
+        log(f"gpu depth24 hold patch skipped: {e}")
+
+
+def patch_sw_guest_grid(template, log=print, fail_loud=False):
     """Fix hi-res coverage in the software rasterizer: decide coverage
     on the guest pixel grid instead of rasterizing scaled geometry.
 
@@ -580,21 +805,42 @@ def patch_sw_guest_grid(template, log=print):
         src = Path(template) / "psxrecomp" / "runtime" / "src" / \
             "gpu_sw_renderer.c"
         if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"gpu_sw_renderer.c missing under {template} - "
+                    f"cannot apply the software guest-grid patch")
             return
         text = src.read_text()
         if SW_GRID_MARKER in text:
             return
         pairs = [(SW_GRID_OLD_0, SW_GRID_NEW_0), (SW_GRID_OLD_1, SW_GRID_NEW_1), (SW_GRID_OLD_2, SW_GRID_NEW_2), (SW_GRID_OLD_3, SW_GRID_NEW_3), (SW_GRID_OLD_4, SW_GRID_NEW_4), (SW_GRID_OLD_5, SW_GRID_NEW_5), (SW_GRID_OLD_6, SW_GRID_NEW_6), (SW_GRID_OLD_7, SW_GRID_NEW_7), (SW_GRID_OLD_8, SW_GRID_NEW_8), (SW_GRID_OLD_9, SW_GRID_NEW_9), (SW_GRID_OLD_10, SW_GRID_NEW_10), (SW_GRID_OLD_11, SW_GRID_NEW_11)]
-        for old, new in pairs:
-            if old not in text:
-                return
+        missing = [i for i, (old, _n) in enumerate(pairs)
+                   if old not in text]
+        if missing:
+            if fail_loud:
+                raise StageError(
+                    f"gpu_sw_renderer.c in {template} does NOT take "
+                    f"the software guest-grid patch: {len(missing)} "
+                    f"of {len(pairs)} anchors missing {missing} - "
+                    f"this renderer variant is not covered by this "
+                    f"tool version, and the game would ship WITHOUT "
+                    f"the Doom / Final Doom striping fix (software "
+                    f"renderer). Failing the job instead of shipping "
+                    f"it broken; update the tool or the template.")
+            return
         for old, new in pairs:
             text = text.replace(old, new, 1)
         src.write_text(text)
         log("patched gpu_sw_renderer.c: guest-grid coverage for "
             "hi-res software rendering (Doom / Final Doom striping "
             "fix; software renderer)")
+    except StageError:
+        raise
     except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"software guest-grid patch failed on {template}: "
+                f"{e}") from e
         log(f"sw guest-grid patch skipped: {e}")
 
 
@@ -740,7 +986,7 @@ GL_GRID_OLD_34 = '        p_glVertexAttribPointer(11, 4, GL_FLOAT, GL_FALSE, st,
 
 GL_GRID_NEW_34 = '        p_glVertexAttribPointer(11, 4, GL_FLOAT, GL_FALSE, st, (void*)(21*sizeof(float))); p_glEnableVertexAttribArray(11); /* HD source */\n        p_glVertexAttribPointer(12, 1, GL_FLOAT, GL_FALSE, st, (void*)(25*sizeof(float))); p_glEnableVertexAttribArray(12); /* HD alpha mode */\n        p_glVertexAttribPointer(13, 1, GL_FLOAT, GL_FALSE, st, (void*)(26*sizeof(float))); p_glEnableVertexAttribArray(13); /* filter */\n        p_glVertexAttribPointer(14, 4, GL_FLOAT, GL_FALSE, st, (void*)(27*sizeof(float))); p_glEnableVertexAttribArray(14); /* gg record */\n    }\n\n    /* Guest-grid GEO VAO: attribs 0/1 read the shared s_geo_vbo exactly\n     * like s_geo_vao; attribs 2..7 read the side buffer (GG_STRIDE). */\n    if (s_geo_grid_prog) {\n        GLsizei gst = GG_STRIDE * sizeof(float);\n        p_glGenVertexArrays(1, &s_geo_grid_vao);\n        p_glBindVertexArray(s_geo_grid_vao);\n        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);\n        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);\n        p_glEnableVertexAttribArray(0);\n        p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)(2 * sizeof(float)));\n        p_glEnableVertexAttribArray(1);\n        p_glGenBuffers(1, &s_geo_grid_vbo);\n        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_grid_vbo);\n        p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, gst, (void *)0);                  p_glEnableVertexAttribArray(2); /* gg record */\n        fprintf(stdout, "psxrecomp: GL guest-grid coverage active (PSX_GL_GRID=0 disables)\\n");\n    } else {\n        fprintf(stdout, "psxrecomp: GL guest-grid GEO program unavailable; flat/gouraud grid disabled\\n");\n    }\n\n    p_glGenVertexArrays(1, &s_blit_vao);\n'
 
-def patch_gl_guest_grid(template, log=print):
+def patch_gl_guest_grid(template, log=print, fail_loud=False):
     """Fix hi-res coverage in the OpenGL renderer: guest-pixel
     ownership test in the fragment shader, replicating the native
     rasterizer's biased edge DDA exactly.
@@ -792,21 +1038,42 @@ def patch_gl_guest_grid(template, log=print):
         src = Path(template) / "psxrecomp" / "runtime" / "src" / \
             "gpu_gl_renderer.c"
         if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"gpu_gl_renderer.c missing under {template} - "
+                    f"cannot apply the OpenGL guest-grid patch")
             return
         text = src.read_text()
         if GL_GRID_MARKER in text:
             return
         pairs = [(GL_GRID_OLD_0, GL_GRID_NEW_0), (GL_GRID_OLD_1, GL_GRID_NEW_1), (GL_GRID_OLD_2, GL_GRID_NEW_2), (GL_GRID_OLD_3, GL_GRID_NEW_3), (GL_GRID_OLD_4, GL_GRID_NEW_4), (GL_GRID_OLD_5, GL_GRID_NEW_5), (GL_GRID_OLD_6, GL_GRID_NEW_6), (GL_GRID_OLD_7, GL_GRID_NEW_7), (GL_GRID_OLD_8, GL_GRID_NEW_8), (GL_GRID_OLD_9, GL_GRID_NEW_9), (GL_GRID_OLD_10, GL_GRID_NEW_10), (GL_GRID_OLD_11, GL_GRID_NEW_11), (GL_GRID_OLD_12, GL_GRID_NEW_12), (GL_GRID_OLD_13, GL_GRID_NEW_13), (GL_GRID_OLD_14, GL_GRID_NEW_14), (GL_GRID_OLD_15, GL_GRID_NEW_15), (GL_GRID_OLD_16, GL_GRID_NEW_16), (GL_GRID_OLD_17, GL_GRID_NEW_17), (GL_GRID_OLD_18, GL_GRID_NEW_18), (GL_GRID_OLD_19, GL_GRID_NEW_19), (GL_GRID_OLD_20, GL_GRID_NEW_20), (GL_GRID_OLD_21, GL_GRID_NEW_21), (GL_GRID_OLD_22, GL_GRID_NEW_22), (GL_GRID_OLD_23, GL_GRID_NEW_23), (GL_GRID_OLD_24, GL_GRID_NEW_24), (GL_GRID_OLD_25, GL_GRID_NEW_25), (GL_GRID_OLD_26, GL_GRID_NEW_26), (GL_GRID_OLD_27, GL_GRID_NEW_27), (GL_GRID_OLD_28, GL_GRID_NEW_28), (GL_GRID_OLD_29, GL_GRID_NEW_29), (GL_GRID_OLD_30, GL_GRID_NEW_30), (GL_GRID_OLD_31, GL_GRID_NEW_31), (GL_GRID_OLD_32, GL_GRID_NEW_32), (GL_GRID_OLD_33, GL_GRID_NEW_33), (GL_GRID_OLD_34, GL_GRID_NEW_34)]
-        for old, new in pairs:
-            if old not in text:
-                return
+        missing = [i for i, (old, _n) in enumerate(pairs)
+                   if old not in text]
+        if missing:
+            if fail_loud:
+                raise StageError(
+                    f"gpu_gl_renderer.c in {template} does NOT take "
+                    f"the OpenGL guest-grid patch: {len(missing)} "
+                    f"of {len(pairs)} anchors missing {missing} - "
+                    f"this renderer variant is not covered by this "
+                    f"tool version, and the game would ship WITHOUT "
+                    f"the Doom / Final Doom striping fix (OpenGL "
+                    f"renderer). Failing the job instead of shipping "
+                    f"it broken; update the tool or the template.")
+            return
         for old, new in pairs:
             text = text.replace(old, new, 1)
         src.write_text(text)
         log("patched gpu_gl_renderer.c: guest-grid coverage for "
             "hi-res OpenGL rendering (Doom / Final Doom striping "
             "fix; OpenGL renderer)")
+    except StageError:
+        raise
     except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"OpenGL guest-grid patch failed on {template}: "
+                f"{e}") from e
         log(f"gl guest-grid patch skipped: {e}")
 
 def probe_cue(runner, cue, template, players=1, json_out=None):
@@ -1034,11 +1301,31 @@ def stage_patch_cmake(r, job):
         (r'GEN_MARKER\s+"[^"]*"', f'GEN_MARKER "generated/{stem}_dispatch.c"'),
         (r'GEN_FULL_GLOB\s+"[^"]*"', f'GEN_FULL_GLOB "generated/{stem}_full_*.c"'),
         (r'WINDOW_TITLE\s+"[^"]*"', f'WINDOW_TITLE "{job.name}"'),
+        # Pin the binary's file name to job.name via the framework's
+        # explicit EXE_NAME argument (psxrecomp_add_game_runtime
+        # forwards it to psxrecomp_add_runtime_target, where an
+        # explicit EXE_NAME wins). Without it the framework derives
+        # OUTPUT_NAME as MAKE_C_IDENTIFIER(WINDOW_TITLE) - and that
+        # rule prepends "_" when the identifier starts with a digit,
+        # so "007Racing" linked as "_007Racing" while stage_build,
+        # stage_verify and stage_package all look for job.name (the
+        # 007 Racing / Tomorrow Never Dies / The World Is Not Enough
+        # failures, 2026-11-07: the full pipeline ran, then "build
+        # finished but .../007Racing is missing/empty"). For
+        # letter-leading names EXE_NAME equals the derived name, so
+        # existing titles produce identical binaries and packages.
+        # The optional second group makes the sub idempotent: an
+        # EXE_NAME line left by an earlier patch run is replaced,
+        # never duplicated.
+        (r'(WINDOW_TITLE\s+"[^"]*")(\n[ \t]*EXE_NAME\s+"[^"]*")?',
+         f'\\g<1>\n    EXE_NAME "{job.name}"'),
         (r'MAX_PLAYERS\s+\d+', f'MAX_PLAYERS {players}'),
     ])
     r.log(f"CMakeLists patched for {stem} (players {players}): {changed}")
     if f"generated/{stem}_dispatch.c" not in cm.read_text():
         raise StageError("GEN_MARKER patch did not land - check CMakeLists")
+    if f'EXE_NAME "{job.name}"' not in cm.read_text():
+        raise StageError("EXE_NAME patch did not land - check CMakeLists")
 
 
 RA_CMAKE_BLOCK = '''
@@ -1254,7 +1541,8 @@ def stage_verify(r, job):
         checks.append((repo / "build-windows" / (job.name + ".exe"),
                        "x86_64-w64-mingw32-nm"))
     for exe, nm in checks:
-        p = subprocess.run([nm, str(exe)], capture_output=True, text=True)
+        p = subprocess.run([nm, str(exe)], capture_output=True, text=True,
+                           timeout=600)
         syms = p.stdout.lower()
         count = len(re.findall(r"\bfunc_[0-9a-f]{8}\b", syms))
         if count == 0 or entry not in syms:
@@ -1300,13 +1588,16 @@ def _cg_tag(r, job, game_toml, build_dir):
     only the flavor comes from the target's own build dir."""
     repo = job.repo
     script = repo / "psxrecomp" / "tools" / "release_stage.py"
-    out = subprocess.run(
-        ["python3", script, "cg-tag",
-         "--runtime-include", repo / "psxrecomp" / "runtime" / "include",
-         "--recompiler", repo / "build-recompiler" / "psxrecomp-game",
-         "--game-toml", game_toml,
-         "--flavor-from-build", build_dir],
-        capture_output=True, text=True)
+    try:
+        out = subprocess.run(
+            ["python3", script, "cg-tag",
+             "--runtime-include", repo / "psxrecomp" / "runtime" / "include",
+             "--recompiler", repo / "build-recompiler" / "psxrecomp-game",
+             "--game-toml", game_toml,
+             "--flavor-from-build", build_dir],
+            capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise StageError("release_stage cg-tag timed out after 300s")
     lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
     if out.returncode != 0 or not lines:
         raise StageError("release_stage cg-tag failed: "
@@ -1346,7 +1637,7 @@ def stage_emitters_mingw(r, job):
             continue
         q = subprocess.run(["x86_64-w64-mingw32-gcc",
                             f"-print-file-name={dll}"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=60)
         src = Path(q.stdout.strip())
         if src.is_file():
             shutil.copy2(src, bdir / dll)
@@ -1563,6 +1854,10 @@ def warm_run_overlay(r, job, warm):
     finally:
         if xvfb is not None:
             xvfb.terminate()
+            try:
+                xvfb.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                xvfb.kill()
     log_text = (log_path.read_text(errors="replace")
                 if log_path.exists() else "")
     for line in log_text.splitlines():
@@ -2073,6 +2368,56 @@ def stage_package(r, job):
     return made
 
 
+def package_paths(job):
+    """The exact zip paths stage_package writes for this job's
+    requested targets: <root>/<Name>-<Target>.zip. Exact paths on
+    purpose - never a glob or prefix match: 'SouthPark' is a prefix
+    of 'SouthParkRally', and a pattern check could credit one
+    game's package to another."""
+    out = []
+    if job.settings.build_linux:
+        out.append(job.root / f"{job.name}-Linux.zip")
+    if job.settings.build_windows:
+        out.append(job.root / f"{job.name}-Windows.zip")
+    return out
+
+
+def missing_packages(job):
+    """Requested-target packages that do not exist or are empty.
+    A conversion that produced no package is a FAILED conversion,
+    never a silent 'done' - the same rule the converter family's
+    release checks apply to wrapped tools that exit 0 with no
+    output. Requesting no targets at all counts as missing."""
+    paths = package_paths(job)
+    if not paths:
+        return [job.root / "(no build targets selected)"]
+    return [p for p in paths
+            if not (p.is_file() and p.stat().st_size > 0)]
+
+
+def job_packages_complete(job):
+    """Ground truth for 'is this queue item already converted?':
+    every requested target's package exists and is non-empty.
+    Multi-disc sets that boot different programs convert as one
+    build per disc (the split route: <Name>Disc<i> projects, each
+    with its own packages) instead of one package set - accept
+    that complete per-disc set too. Anything ambiguous returns
+    False: re-running wastes time, but a wrong 'complete' would
+    hide a game that was never converted."""
+    if not missing_packages(job):
+        return True
+    if len(job.cues) > 1:
+        for i, cue in enumerate(job.cues):
+            sub = Job(cues=[cue],
+                      name=f"{job.name}Disc{i + 1}",
+                      title=job.title,
+                      work_dir=job.work_dir, settings=job.settings)
+            if missing_packages(sub):
+                return False
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- driver
 
 STAGES = ["scaffold", "probe", "patch", "ra", "emitters", "generate",
@@ -2091,12 +2436,13 @@ def run_job(job, log, stop_after=None):
                          "download failed (check your connection and "
                          "that git is installed)")
     log(f"template project: {template}")
-    patch_probe_subdir_boot(template, log)
-    patch_overlay_draw_chain(template, log)
-    patch_cdrom_getlocp(template, log)
-    patch_gpu_depth24_span(template, log)
-    patch_sw_guest_grid(template, log)
-    patch_gl_guest_grid(template, log)
+    patch_probe_subdir_boot(template, log, fail_loud=True)
+    patch_overlay_draw_chain(template, log, fail_loud=True)
+    patch_cdrom_getlocp(template, log, fail_loud=True)
+    patch_gpu_depth24_span(template, log, fail_loud=True)
+    patch_gpu_depth24_hold(template, log, fail_loud=True)
+    patch_sw_guest_grid(template, log, fail_loud=True)
+    patch_gl_guest_grid(template, log, fail_loud=True)
     if len(job.cues) > 1:
         # Disc-set routing BEFORE any building: probe every disc and
         # check the set. One program -> fall through and build ONE
@@ -2136,12 +2482,20 @@ def run_job(job, log, stop_after=None):
         plan.append("windows")
     steps = [
         ("scaffold", lambda: (stage_scaffold(r, job, template),
-                              patch_probe_subdir_boot(job.repo, log),
-                              patch_overlay_draw_chain(job.repo, log),
-                              patch_cdrom_getlocp(job.repo, log),
-                              patch_gpu_depth24_span(job.repo, log),
-                              patch_sw_guest_grid(job.repo, log),
-                              patch_gl_guest_grid(job.repo, log))),
+                              patch_probe_subdir_boot(job.repo, log,
+                                                  fail_loud=True),
+                              patch_overlay_draw_chain(job.repo, log,
+                                                  fail_loud=True),
+                              patch_cdrom_getlocp(job.repo, log,
+                                                  fail_loud=True),
+                              patch_gpu_depth24_span(job.repo, log,
+                                                  fail_loud=True),
+                              patch_gpu_depth24_hold(job.repo, log,
+                                                  fail_loud=True),
+                              patch_sw_guest_grid(job.repo, log,
+                                                  fail_loud=True),
+                              patch_gl_guest_grid(job.repo, log,
+                                                  fail_loud=True))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
         ("ra", lambda: stage_ra(r, job)),
@@ -2157,6 +2511,14 @@ def run_job(job, log, stop_after=None):
         if stop_after == name:
             log(f"stopped after {name} (requested)")
             return name
+    # Output gate: returning 'done' requires the packages to exist.
+    # (The disc-set split route returns earlier; its per-disc
+    # sub-jobs pass through this same gate individually.)
+    missing = missing_packages(job)
+    if missing:
+        raise StageError(
+            "conversion ran to the end but produced no package: "
+            + ", ".join(str(p) for p in missing))
     return "done"
 
 

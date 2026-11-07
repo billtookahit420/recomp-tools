@@ -10,6 +10,9 @@ if [ ! -x .venv/bin/python ]; then
         echo "then run ./recomp-tools.sh again."
         exit 1
     }
+fi
+if ! .venv/bin/python -c "import PySide6" 2>/dev/null; then
+    echo "Installing Python dependencies..."
     .venv/bin/pip install -r requirements.txt || {
         echo "Dependency install failed - check your connection and re-run."
         exit 1

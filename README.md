@@ -43,6 +43,68 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.20 (2026-11-07)** — Queue truth, plus three field
+  fixes. (1) Digit-leading titles finish: games whose titles
+  start with a digit (007 Racing, 007 The World Is Not Enough,
+  007 Tomorrow Never Dies) converted completely, then failed at
+  the finish line — the framework derived the finished
+  program's name with a leading underscore (`_007Racing`) while
+  the tool checked for the plain name. The engine now pins the
+  program name in the scaffolded project, so these games build,
+  verify and package under their real names; letter-leading
+  titles are unchanged. Proven end to end on the real 007
+  Racing disc (full pipeline, program named exactly
+  `007Racing`, booted to its PRESS START title) and through
+  verify on 007 The World Is Not Enough; the Windows program
+  name is configure-verified only (a full Windows compile of
+  these titles was not run). (2) Gran Turismo title-screen
+  crop: a static 24-bit screen shown right after a display-band
+  change (GT's 640x480 title) lost its right ~80 px for the
+  whole session — the depth24 coverage counter discarded
+  uploads landing in the present-hold after the change, and
+  the change itself zeroed the count, so a once-uploaded
+  picture never re-grew it. The engine's depth24 patch now
+  counts those uploads and defers the reset to the next
+  upload. Verified in the development VM (GT rebuilt
+  pixel-identical to the pre-fix build outside the patched
+  accounting; the Resident Evil: Director's Cut movie
+  regression check still passes full width) — the deciding
+  test on real hardware, GT's title screen at full width, is
+  still to come, so treat this fix as shipped but not yet
+  hardware-confirmed. (3) The queue can no longer lie about
+  status. Field reports from a 34-disc run: rows read "done"
+  for games with no package in the output folder, a game read
+  "done" while still converting, finished games' rows lagged
+  behind the work, and a reopened queue re-converted finished
+  games from scratch. Now a job reports done only after every
+  package it was asked for is verified present and non-empty
+  on disk (exact filenames, so South Park can never borrow
+  South Park Rally's package); the queue reconciles against
+  the output folder when games are added and before every run,
+  so finished games show done and are skipped; statuses move
+  in one direction only and are routed by game, not by row
+  position; rows cannot be removed or merged mid-run; a second
+  Run press is a logged no-op; and the log window paints in
+  batches instead of line by line, so a long compile's output
+  can no longer starve the status column. The engine's
+  subprocess runner also gained the wall-clock deadline the
+  cartridge tools already had — a conversion step that goes
+  silent can no longer hang a queue forever — and the
+  framework-clone, symbol-check and tag calls gained timeouts
+  of their own. Covered by 23 automated queue tests. (4)
+  Engine patches fail loud: the seven text patches the engine
+  applies to the framework (probe subdirectory boot, overlay
+  draw chain, CD GetlocP, depth24 span and hold, and both
+  guest-grid renderer patches) used to skip silently when a
+  framework update moved their anchors, so a game could ship
+  missing a fix with no sign. A patch that cannot land now
+  fails the job with the reason instead of shipping the game
+  broken. All seven are verified landing on a fresh framework
+  download and still idempotent on re-runs. Also: the launcher
+  script now retries the dependency install when the
+  environment exists but its packages are missing (previously
+  only a first-ever run installed them).
+
 - **v1.0.19 (2026-11-06)** — Doom / Final Doom wall & floor
   striping fix (software + OpenGL renderers): at internal
   resolution above 1x, textured walls and floors in Doom-engine
