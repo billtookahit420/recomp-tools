@@ -8,6 +8,7 @@ with a live log. Built for Duane so conversions don't need the CLI.
 Run:  .venv/bin/python app/main.py
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -68,7 +69,11 @@ queue moves on.
 MULTI-DISC GAMES
 Just add the discs - one at a time with "Add Disc", or together with
 "Add Disc Set". Discs from the same folder with the same game title
-are grouped into ONE queue item automatically. When the set runs, it
+are grouped into ONE queue item automatically. Or pick the folder
+that holds your games with "Add Library Folder": it scans up to 4
+folders deep (hidden folders are skipped) and adds every .cue it
+finds the same way, so a whole library lands in the queue in one go
+and multi-disc sets still group into one item each. When the set runs, it
 is probed and checked: if all discs boot the SAME program (Metal Gear
 Solid, Evil Dead, Driver 2), you get ONE package and the launcher
 offers disc selection. If the discs boot DIFFERENT programs
@@ -130,18 +135,34 @@ finish, verify and package under their real names.
 Letter-leading titles are unchanged. Re-run an affected game
 here to convert it cleanly.
 
-TITLE SCREEN CUT OFF AT THE RIGHT (FIXED IN v1.0.20)
+TITLE SCREEN CUT OFF AT THE RIGHT (v1.0.20 FIX WAS NOT ENOUGH)
 A few games show one static 24-bit screen - Gran Turismo's
 640x480 title screen is the known case - with the right side
 cut off (about 80 px black), while menus and gameplay render
-full width. The framework's 24-bit coverage counter discarded
-uploads that landed in the short present-hold after a display
-change, and the change itself zeroed the count, so a picture
-uploaded once and never again stayed partly uncounted and the
-presenter blanked the rest. Builds made with v1.0.20 or later
-count every upload, and the next upload starts the new
-picture's count instead of the change zeroing it. Re-run an
-affected game here to fix its package.
+full width. v1.0.20 shipped a coverage fix for this, but on
+hardware the crop is UNCHANGED: the packaged binary carried
+the fix, yet the picture still loses the same right strip, and
+the run never enters the code the fix patched. A diagnostic
+build is out to find which path actually blanks those
+columns; until that lands and a fix is verified on hardware,
+treat the crop as still open - do not re-run Gran Turismo
+expecting this build to fix it.
+
+PROBE RESULTS ON THE WRONG GAME, OR NEVER ARRIVING (FIXED IN
+v1.0.21)
+Added games are probed in the background, one after another.
+Two defects in that chain: results were matched to games by
+queue row, so removing a row while probes were still running
+shifted later results onto the wrong games - a row could end
+up wearing another game's disc details; and about one run in
+three, the last game in a batch was never probed at all,
+because a game left the waiting list the moment its probe
+started, so one missed step ended the chain early. Results
+now travel with the game they belong to, results for games
+removed mid-flight are dropped, and a game stays on the
+waiting list until its own result arrives. This covers "Add
+Disc" and "Add Disc Set" too - every add shares the same
+chain.
 
 GAMES THAT STUTTER ON RUNTIME-LOADED CODE (IMPROVED IN v1.0.18)
 Some games load part of their code from the disc while they run
@@ -331,11 +352,16 @@ class InstallWorker(QThread):
 
 class ProbeWorker(QThread):
     log_line = Signal(str)
-    probed = Signal(int, dict)
+    probed = Signal(object, dict)
 
-    def __init__(self, row, cues, template, players):
+    def __init__(self, item, cues, template, players):
         super().__init__()
-        self.row, self.cues = row, cues
+        # Carry the queue ITEM, not its row number: rows shift when
+        # the user removes (or a folder-add appends) items while a
+        # probe is in flight, and a result keyed by row number would
+        # land on whatever item now sits in that row. The run
+        # worker already routes by identity; probes do the same.
+        self.item, self.cues = item, cues
         self.template, self.players = template, players
 
     def run(self):
@@ -349,7 +375,7 @@ class ProbeWorker(QThread):
             if self.template is None:
                 self.log_line.emit("FAILED: framework download failed "
                                    "(needs git + a connection)")
-                self.probed.emit(self.row, {})
+                self.probed.emit(self.item, {})
                 return
             probes = []
             paths = []
@@ -366,11 +392,11 @@ class ProbeWorker(QThread):
             art = engine.fetch_cover(
                 self.cues[0], ART_CACHE,
                 serial=(probes[0].get("serial", "") if probes else ""))
-            self.probed.emit(self.row, {"probes": probes, "verdict": verdict,
+            self.probed.emit(self.item, {"probes": probes, "verdict": verdict,
                                         "art": str(art) if art else ""})
         except Exception:
             self.log_line.emit(traceback.format_exc())
-            self.probed.emit(self.row, {})
+            self.probed.emit(self.item, {})
 
 
 class MainWindow(QMainWindow):
@@ -424,6 +450,7 @@ class MainWindow(QMainWindow):
         btns = QHBoxLayout()
         for label, fn in (("Add Disc", self.add_disc),
                           ("Add Disc Set", self.add_set),
+                          ("Add Library Folder", self.add_library_folder),
                           ("Probe Selected", self.probe_selected),
                           ("Remove", self.remove_selected)):
             b = QPushButton(label)
@@ -777,6 +804,198 @@ class MainWindow(QMainWindow):
         if ps:
             self._add_item(sorted(ps))
 
+    # How many folder levels below the picked library root the
+    # "Add Library Folder" scan descends. Real layouts are shallow:
+    # library/Game/cue (1), library/Game/Disc 1/cue (2), redump
+    # per-disc folders (2). Four levels covers those with room to
+    # spare while keeping a scan pointed at a whole drive bounded.
+    LIBRARY_SCAN_MAX_DEPTH = 4
+
+    # Folder names that hold conversion projects / framework trees,
+    # never loose game discs: the project folder written per game
+    # (<slug>-recomp, containing game/) and the framework trees a
+    # project carries (psxrecomp/, recomp-ui/). A cue found under
+    # one is a project's PRIVATE staging copy - its game/disc cue -
+    # and adding it would queue the same conversion twice, once from
+    # the library copy and once from inside its own project.
+    _LIBRARY_SKIP_DIR_SUFFIX = "-recomp"
+    _LIBRARY_SKIP_DIR_NAMES = ("psxrecomp", "recomp-ui")
+
+    @classmethod
+    def _scan_library(cls, root):
+        """Recursively find .cue files under a library root.
+
+        Returns (cues, deep_skipped): cue paths as strings in the
+        same sorted order a manual multi-add would produce, deduped
+        by resolved path, plus how many cues were left unadded
+        because they sit deeper than LIBRARY_SCAN_MAX_DEPTH.
+        Hidden folders and project/framework folders are pruned,
+        and symlinked folders are not followed, so a scan cannot
+        loop or ingest a conversion project that happens to live
+        inside the picked folder."""
+        root = Path(root)
+        found, seen = [], set()
+        deep = 0
+
+        def prunable(name):
+            n = name.lower()
+            return (name.startswith(".")
+                    or n.endswith(cls._LIBRARY_SKIP_DIR_SUFFIX)
+                    or n in cls._LIBRARY_SKIP_DIR_NAMES)
+
+        def count_deep(d):
+            # Count every cue in a subtree the depth floor cut off,
+            # so the "skipped for depth" number is honest about the
+            # whole buried branch, not just its top folder. Same
+            # pruning as the scan itself (hidden / project folders
+            # and symlinks are not chased here either).
+            nonlocal deep
+            try:
+                entries = sorted(d.iterdir(), key=lambda p: p.name)
+            except OSError:
+                return
+            for p in entries:
+                if p.is_symlink():
+                    if not p.is_dir() and \
+                            p.name.lower().endswith(".cue"):
+                        deep += 1
+                    continue
+                if p.is_dir():
+                    if not prunable(p.name):
+                        count_deep(p)
+                elif p.name.lower().endswith(".cue"):
+                    deep += 1
+
+        def visit(d, depth):
+            # Own the walk instead of os.walk so a subtree cut off
+            # by the depth floor can still be counted (count_deep)
+            # for the summary line, not silently dropped.
+            try:
+                entries = sorted(d.iterdir(), key=lambda p: p.name)
+            except OSError:
+                return
+            for p in entries:
+                if p.is_symlink():
+                    if p.is_dir():
+                        continue            # never follow links
+                    cue = p             # a linked cue file itself is
+                elif p.is_dir():        # fine - resolve() dedupes it
+                    if prunable(p.name):
+                        continue
+                    if depth + 1 <= cls.LIBRARY_SCAN_MAX_DEPTH:
+                        visit(p, depth + 1)
+                    else:
+                        count_deep(p)
+                    continue
+                else:
+                    cue = p
+                if cue.name.lower().endswith(".cue"):
+                    key = str(cue.resolve())
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(str(cue))
+
+        visit(root, 0)
+        return sorted(found), deep
+
+    def add_library_folder(self):
+        root = QFileDialog.getExistingDirectory(
+            self, "Pick the folder that holds your PS1 games")
+        if root:
+            self.add_library(root)
+
+    def add_library(self, root):
+        """Scan a library folder and add every cue it holds through
+        the same _add_item path as manual adds: multi-disc sets
+        group into one queue item, every item auto-probes, and the
+        disk reconcile marks anything already converted as done
+        instead of queueing a second conversion."""
+        cues, deep = self._scan_library(root)
+        if not cues:
+            self.log_line(f"Add Library Folder: no .cue files found "
+                          f"in {root} - nothing added.")
+            QMessageBox.information(
+                self, "Add Library Folder",
+                "No .cue files found in that folder.")
+            return
+        before_ids = {id(it) for it in self.items}
+        before_cues = {c for it in self.items for c in it["cues"]}
+        before_keys = {id(it): self._set_key(it["cues"])
+                       for it in self.items}
+        for cue in cues:
+            self._add_item([cue])
+        # Read the outcome back off the queue itself - every number
+        # below is measured from what the adds actually did, not
+        # predicted: grouping, exact re-adds and run-time deferrals
+        # are all decided inside _add_item, and this is the only
+        # place that can see all of them at once.
+        new_items = [it for it in self.items if id(it) not in before_ids]
+        now_cues = {c for it in self.items for c in it["cues"]}
+        fresh = [c for c in cues if c not in before_cues]
+        grouped_new = [c for c in fresh
+                       if c in now_cues
+                       and not any(c in it["cues"] for it in new_items)]
+        deferred = []
+        for c in fresh:
+            if c in now_cues:
+                continue
+            folder, title = self._set_key([c])
+            if any(before_keys[id(it)][1] == title
+                   and any(cc in it["cues"] for cc in cues)
+                   for it in self.items if id(it) in before_ids):
+                # Not queued, and an item that was already in the
+                # queue carries this scan's other disc(s) of the
+                # same title: its merge was refused by the mid-run
+                # guard (the only path that drops an add like this).
+                deferred.append(c)
+        # Group this scan's cues by the key of the ITEM each one
+        # landed in (post-grouping), mapping title -> the distinct
+        # items that title produced. A title producing MORE THAN
+        # ONE item means the same game was found in more than one
+        # place and every copy queued separately. Keying on the
+        # scan-side _set_key alone cannot see this: that key is
+        # layout-sensitive by design (it climbs out of disc-named
+        # folders), so one set legitimately arrives under several
+        # scan keys, and two copies under different set roots
+        # arrive under different keys too.
+        landed = {}
+        for c in cues:
+            for it in self.items:
+                if c in it["cues"]:
+                    landed.setdefault(
+                        self._set_key(it["cues"])[1], set()).add(id(it))
+                    break
+        doubles = []
+        for it in new_items:
+            title = self._set_key(it["cues"])[1]
+            if len(landed.get(title, ())) > 1:
+                # This scan queued this title as more than one
+                # item: the same game from more than one place.
+                # Every copy stays queued (the normal path decided
+                # - same-set discs grouped, separate copies did
+                # not), and the summary counts the items, so
+                # nobody wonders why the game appears twice.
+                doubles.append(it)
+        self.log_line(
+            f"Add Library Folder: scanned {root} - {len(cues)} .cue "
+            f"file(s) found, {len(new_items)} queue item(s) added"
+            + (f", {len(grouped_new)} cue(s) grouped into sets "
+               f"already in the queue" if grouped_new else "")
+            + (f", {len(cues) - len(fresh)} cue(s) already queued "
+               f"exactly (skipped)"
+               if len(cues) - len(fresh) else "")
+            + (f", {len(deferred)} cue(s) deferred - their set is "
+               f"in the queue and a run is in progress; add them "
+               f"again after it finishes" if deferred else "")
+            + (f", {len(doubles)} item(s) are the same game found "
+               f"in more than one place - every copy was queued "
+               f"({'; '.join(it['title'] for it in doubles)})"
+               if doubles else "")
+            + (f", {deep} cue(s) skipped - deeper than "
+               f"{self.LIBRARY_SCAN_MAX_DEPTH} folder(s) down" if deep
+               else "")
+            + ".")
+
     def remove_selected(self):
         if self._run_active:
             # Removing a row mid-run shifts every row below it; the
@@ -803,30 +1022,59 @@ class MainWindow(QMainWindow):
     def _queue_probe(self, row, force=False):
         """Probe a row now, or after the running probe finishes. Adding
         a disc auto-probes it; re-adding/probing a probed row needs the
-        manual button (force)."""
-        if not force and self.items[row]["probes"]:
+        manual button (force). The pending queue carries the ITEM, not
+        the row number, so a removal while probes are queued cannot
+        shift a pending probe onto a different game."""
+        item = self.items[row]
+        if not force and item["probes"]:
             return
-        if self.probe_worker is not None and self.probe_worker.isRunning():
-            if row not in self._probe_pending:
-                self._probe_pending.append(row)
-            return
-        self._start_probe(row)
+        if item not in self._probe_pending:
+            self._probe_pending.append(item)
+        if self.probe_worker is None or not self.probe_worker.isRunning():
+            self._probe_next()
 
-    def _start_probe(self, row):
+    def _start_probe(self, item):
         template = engine.find_template(self.tpl_edit.text().strip())
-        self._fill_row(row, self.items[row], "probing")
-        self.probe_worker = ProbeWorker(row, self.items[row]["cues"],
+        if item not in self.items:
+            return
+        self._fill_row(self.items.index(item), item, "probing")
+        self.probe_worker = ProbeWorker(item, item["cues"],
                                         template, self.players_spin.value() or 1)
         self.probe_worker.log_line.connect(self.log_line)
         self.probe_worker.probed.connect(self._on_probed)
+        # An item whose probe has been STARTED stays in the pending
+        # list until its result lands. _start_probe is only ever
+        # called from _probe_next, which pops from the FRONT; items
+        # enter the list only via _queue_probe, and a result landing
+        # removes its own item wherever it sits. Nothing ever
+        # references a probe by position, so removing a row while
+        # probes are in flight cannot misroute or lose one. (The
+        # earlier version popped the item when STARTING its probe
+        # and let removal-during-probe plus signal queueing decide
+        # whether the rest of the chain ever ran - sometimes it
+        # did not.)
+        self._probe_running = item
         self.probe_worker.start()
 
-    def _on_probed(self, row, data):
-        if not data:
-            self._fill_row(row, self.items[row], "probe failed")
+    def _on_probed(self, item, data):
+        # Consume this item's pending entry wherever it sits - it
+        # stays listed from queueing until its result lands (see
+        # _start_probe), so a result that arrives after reordering
+        # still finds and clears exactly its own entry.
+        if item in self._probe_pending:
+            self._probe_pending.remove(item)
+        if getattr(self, "_probe_running", None) is item:
+            self._probe_running = None
+        if item not in self.items:
+            # The item was removed while its probe was in flight:
+            # the result has no home - drop it, keep chaining.
             self._probe_next()
             return
-        item = self.items[row]
+        row = self.items.index(item)
+        if not data:
+            self._fill_row(row, item, "probe failed")
+            self._probe_next()
+            return
         item["probes"] = data["probes"]
         item["verdict"] = data["verdict"]
         item["art"] = data["art"]
@@ -839,11 +1087,14 @@ class MainWindow(QMainWindow):
         self._probe_next()
 
     def _probe_next(self):
-        while self._probe_pending:
-            row = self._probe_pending.pop(0)
-            if 0 <= row < len(self.items):
-                self._start_probe(row)
-                return
+        for item in list(self._probe_pending):
+            if item is getattr(self, "_probe_running", None):
+                continue            # started; result still coming
+            if item not in self.items:
+                self._probe_pending.remove(item)
+                continue            # removed while waiting its turn
+            self._start_probe(item)
+            return
 
     def show_selected(self):
         rows = {i.row() for i in self.table.selectedIndexes()}

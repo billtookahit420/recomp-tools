@@ -43,6 +43,52 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.21 (2026-11-07)** — Add Library Folder, plus two
+  probe-chain fixes its stress test caught. (1) Add Library
+  Folder: a third add control beside "Add Disc" and "Add Disc
+  Set". Pick the folder that holds your PS1 games and the tool
+  scans it recursively — up to 4 folder levels deep, covering
+  cues in the root, per-game subfolders and per-disc subfolders
+  — and adds every `.cue` it finds through the normal add
+  path. Multi-disc sets group into ONE queue item
+  automatically, however the discs are laid out, and anything
+  whose package is already complete in the output folder
+  reconciles to "done" instead of queueing for a second lap.
+  Hidden folders and the tool's own conversion-project folders
+  (`-recomp`, `psxrecomp`, `recomp-ui`) are skipped, so
+  pointing it at a folder that contains old conversion
+  projects is safe; the same cue found twice is added once; a
+  game found in two different places is counted in the log
+  summary, not silently merged; and a folder with no cues says
+  so in a message box instead of failing silently. Measured on
+  a fabricated fixture library: 300 cues became 290 queue
+  items in about 4 seconds, every item probed. (2) Probe
+  results can no longer land on the wrong game. The probe
+  chain as shipped in v1.0.20 matched results to games by
+  queue row number, so removing a row while probes were still
+  landing shifted later results onto the wrong games — one
+  game's row could end up wearing another game's disc details.
+  Results now travel with the queue item itself, and results
+  for items removed mid-flight are dropped. This covers "Add
+  Disc" and "Add Disc Set" probing too; it is the same chain.
+  (3) The probe chain can no longer lose its last link. In
+  about one run in three, the final queued item was never
+  probed: an item left the pending list when its probe
+  started, so chain advancement depended on a single signal
+  arriving exactly once, and any reordering ended the chain
+  early. An item now stays pending until its own result lands.
+  Both probe defects were caught by the new feature's stress
+  tests and are covered by the 32-check add-library suite
+  (four consecutive runs, zero failures); the queue suite
+  (23/23) and the 007 suite (32/32) still pass. Also: the GUI
+  help text for Gran Turismo's title-screen crop no longer
+  claims it was "FIXED IN v1.0.20" — hardware acceptance of
+  that fix failed on 2026-11-07 (the crop was unchanged), and
+  the help text now says so plainly. The crop itself is NOT
+  fixed by this release; its diagnostic run on real hardware
+  is still pending. No engine changes in this release — GUI
+  only (`app/main.py`, plus this changelog).
+
 - **v1.0.20 (2026-11-07)** — Queue truth, plus three field
   fixes. (1) Digit-leading titles finish: games whose titles
   start with a digit (007 Racing, 007 The World Is Not Enough,
