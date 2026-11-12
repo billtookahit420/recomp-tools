@@ -403,6 +403,90 @@ def boot_path_components(cnf: bytes) -> list[str]:
         log(f"probe subdir patch skipped: {e}")
 
 
+PREFLIGHT_MARKER = "def build_preflight"
+
+PREFLIGHT_OLD_0 = "from the boot EXE text.\n"
+PREFLIGHT_NEW_0 = "from the boot EXE text.\n\nPre-flight: every probe carries a `preflight` section classifying the\ndisc (or, with --disc-set-cue / --disc-set-list, the whole set) against\nthe failure classes that used to surface only mid-build -- shell-hostile\ndisplay names, padded / oversize boot EXEs, multi-program disc sets.\nAdditive only: no existing field changes meaning.\n"
+
+PREFLIGHT_OLD_1 = "SYNC = bytes([0x00] + [0xFF] * 10 + [0x00])\n\n\n"
+PREFLIGHT_NEW_1 = "SYNC = bytes([0x00] + [0xFF] * 10 + [0x00])\n\n# ---------------------------------------------------------------------------\n# Pre-flight classification.\n#\n# Every probe result carries a `preflight` section: a one-line\n# classification plus named flags for the failure classes that used to be\n# discovered only mid-build. All of it derives from data the probe already\n# reads (display name, boot EXE file size vs its PS-X header, cue track\n# layout, and -- for a set -- each disc's boot-program hash).\n#\n#   classification          meaning\n#   CLEAN                   nothing flagged\n#   NEEDS-CLEAN-PATH        flag path-hazard: the display name contains a\n#                           shell-hostile character. The apostrophe is the\n#                           known killer (Tony Hawk's ..., Director's Cut):\n#                           it breaks the quoting of the wayland-scanner\n#                           commands in the Linux runtime build. Build\n#                           under an apostrophe-free path.\n#   PADDED-EXE              flag exe-padded: the boot EXE file is larger\n#                           than its header total (2048 + t_size) and every\n#                           overshoot byte is zero -- mastered-in padding\n#                           (Twisted Metal III, both revisions). The\n#                           converter EXE parser needs the tolerance\n#                           route for this class.\n#   EXE-OVERSIZE-CAUTION    flag exe-oversize-nonzero-tail: overshoot with\n#                           non-zero bytes. NOT assumed to be padding.\n#   EXE-UNDERSIZE-CAUTION   flag exe-undersize: file smaller than its\n#                           header total; truncated/corrupt until proven\n#                           otherwise.\n#   MULTI-EXE-UNSUPPORTED   flag multi-exe-set: the set's discs boot\n#                           different programs (the Xenogears class). The\n#                           framework cannot build N-program sets yet\n#                           (docs/MULTI_DISC.md P2); verify_disc_set.py\n#                           refuses them by name downstream.\n#\n# Track layout is reported informationally under `track_layout`: a\n# single-track cue is how some discs were mastered (the reference archive\n# matches Redump), so it is NOT a failure flag.\n\nSHELL_HOSTILE_CHARS = \"'\\\"`$!;&|<>\\\\\"\n\n_FLAG_TO_CLASSIFICATION = (\n    (\"multi-exe-set\", \"MULTI-EXE-UNSUPPORTED\"),\n    (\"exe-oversize-nonzero-tail\", \"EXE-OVERSIZE-CAUTION\"),\n    (\"exe-undersize\", \"EXE-UNDERSIZE-CAUTION\"),\n    (\"exe-padded\", \"PADDED-EXE\"),\n    (\"path-hazard\", \"NEEDS-CLEAN-PATH\"),\n)\n\n\ndef classify_preflight(flags: list[str]) -> str:\n    for flag, classification in _FLAG_TO_CLASSIFICATION:\n        if flag in flags:\n            return classification\n    return \"CLEAN\"\n\n\ndef path_hazard_chars(name: str) -> list[str]:\n    return sorted({c for c in name if c in SHELL_HOSTILE_CHARS or ord(c) < 0x20})\n\n\ndef build_preflight(*, display_name: str, track_count: int,\n                    exe_file_size: int, exe_header_total: int,\n                    tail_all_zero: bool | None) -> dict:\n    flags: list[str] = []\n    hazard = path_hazard_chars(display_name)\n    if hazard:\n        flags.append(\"path-hazard\")\n    overshoot = exe_file_size - exe_header_total\n    if overshoot > 0:\n        flags.append(\"exe-padded\" if tail_all_zero\n                     else \"exe-oversize-nonzero-tail\")\n    elif overshoot < 0:\n        flags.append(\"exe-undersize\")\n    pf: dict = {\n        \"classification\": classify_preflight(flags),\n        \"flags\": flags,\n        \"exe\": {\n            \"file_size\": exe_file_size,\n            \"header_total\": exe_header_total,\n            \"overshoot_bytes\": overshoot,\n            \"tail_all_zero\": tail_all_zero,\n        },\n        \"track_layout\": {\n            \"track_count\": track_count,\n            \"single_track\": track_count == 1,\n            \"note\": \"as-mastered layout, informational only -- \"\n                    \"not a failure flag\",\n        },\n        \"disc_set\": None,\n    }\n    if hazard:\n        pf[\"path_hazard_chars\"] = hazard\n    return pf\n\n\ndef refresh_path_hazard(preflight: dict, display_name: str) -> None:\n    \"\"\"Recompute the path-hazard flag after a --display-name override.\"\"\"\n    flags = [f for f in preflight.get(\"flags\", []) if f != \"path-hazard\"]\n    hazard = path_hazard_chars(display_name)\n    if hazard:\n        flags.append(\"path-hazard\")\n        preflight[\"path_hazard_chars\"] = hazard\n    else:\n        preflight.pop(\"path_hazard_chars\", None)\n    preflight[\"flags\"] = flags\n    preflight[\"classification\"] = classify_preflight(flags)\n\n\n# Program-identity fields, mirrored from verify_disc_set.py: if these\n# agree across a set's discs, one recompiled program covers the set.\nSET_PROGRAM_FIELDS = (\n    \"boot_exe_sha256\",\n    \"entry_pc\",\n    \"load_address\",\n    \"text_size\",\n    \"stack_base\",\n)\n\n\ndef apply_disc_set_preflight(p: \"DiscProbe\", extra_cues: list[Path]) -> None:\n    \"\"\"Identity-probe the other discs of a set and record in\n    p.preflight[\"disc_set\"] whether the set boots one program or several.\"\"\"\n    members = [p]\n    for cue in extra_cues:\n        members.append(probe(cue, identity_only=True))\n\n    def program_key(m: \"DiscProbe\") -> tuple:\n        return tuple(getattr(m, f) for f in SET_PROGRAM_FIELDS)\n\n    multi = len({program_key(m) for m in members}) > 1\n    p.preflight[\"disc_set\"] = {\n        \"disc_count\": len(members),\n        \"multi_exe\": multi,\n        \"programs\": [\n            {\n                \"cue_name\": m.cue_name,\n                \"serial\": m.serial,\n                \"boot_exe\": m.boot_exe,\n                \"boot_exe_sha256\": m.boot_exe_sha256,\n            }\n            for m in members\n        ],\n    }\n    if multi and \"multi-exe-set\" not in p.preflight[\"flags\"]:\n        p.preflight[\"flags\"].append(\"multi-exe-set\")\n        p.preflight[\"classification\"] = classify_preflight(\n            p.preflight[\"flags\"])\n\n\n"
+
+PREFLIGHT_OLD_2 = "    notes: list[str] = field(default_factory=list)\n"
+PREFLIGHT_NEW_2 = "    notes: list[str] = field(default_factory=list)\n    preflight: dict = field(default_factory=dict)\n"
+
+PREFLIGHT_OLD_3 = "\n    return DiscProbe(\n"
+PREFLIGHT_NEW_3 = "\n    header_total = EXE_HDR + t_size\n    overshoot = bsize - header_total\n    tail_all_zero: bool | None = None\n    if overshoot > 0:\n        tail_all_zero = not any(exe[header_total:])\n    preflight = build_preflight(\n        display_name=display,\n        track_count=len(tracks),\n        exe_file_size=bsize,\n        exe_header_total=header_total,\n        tail_all_zero=tail_all_zero,\n    )\n\n    return DiscProbe(\n"
+
+PREFLIGHT_OLD_4 = "        notes=notes,\n"
+PREFLIGHT_NEW_4 = "        notes=notes,\n        preflight=preflight,\n"
+
+PREFLIGHT_OLD_5 = "    ap.add_argument(\n        \"--out-dir\",\n"
+PREFLIGHT_NEW_5 = "    ap.add_argument(\n        \"--disc-set-cue\",\n        action=\"append\",\n        default=[],\n        help=\"another disc of the same set (its .cue), repeatable, in disc \"\n             \"order after the boot disc. Each is identity-probed and the \"\n             \"boot programs are compared into preflight.disc_set: if the \"\n             \"discs boot different programs the set classifies \"\n             \"MULTI-EXE-UNSUPPORTED (docs/MULTI_DISC.md).\",\n    )\n    ap.add_argument(\n        \"--disc-set-list\",\n        default=\"\",\n        help=\"file of additional set-disc cue paths, one per line, in disc \"\n             \"order. Preferred over repeated --disc-set-cue from a shell: \"\n             \"PS1 dump filenames contain spaces and parentheses.\",\n    )\n    ap.add_argument(\n        \"--out-dir\",\n"
+
+PREFLIGHT_OLD_6 = "    if args.display_name:\n        p.display_name = args.display_name\n\n"
+PREFLIGHT_NEW_6 = "    if args.display_name:\n        p.display_name = args.display_name\n        refresh_path_hazard(p.preflight, p.display_name)\n\n    set_cues = [c for c in (args.disc_set_cue or []) if c.strip()]\n    if args.disc_set_list:\n        lp = Path(args.disc_set_list)\n        if lp.is_file():\n            set_cues += [ln.strip()\n                         for ln in lp.read_text(encoding=\"utf-8\").splitlines()\n                         if ln.strip()]\n    if set_cues:\n        apply_disc_set_preflight(\n            p, [Path(c).expanduser() for c in set_cues]\n        )\n\n"
+
+PREFLIGHT_OLD_7 = "\n    fp_note = f\" disc_fp="
+PREFLIGHT_NEW_7 = "\n    pf = p.preflight or {}\n    pf_flags = pf.get(\"flags\") or []\n    print(\n        f\"  preflight: {pf.get('classification', '?')}\"\n        + (f\" flags={','.join(pf_flags)}\" if pf_flags else \"\"),\n        file=sys.stderr,\n    )\n\n    fp_note = f\" disc_fp="
+
+def patch_probe_preflight(template, log=print, fail_loud=False):
+    """Give every probe a `preflight` section classifying the disc (or,
+    with the probe's --disc-set-cue / --disc-set-list options, the whole
+    set) against the failure classes that used to surface only
+    mid-build: shell-hostile display names (path-hazard ->
+    NEEDS-CLEAN-PATH), a boot EXE larger than its PS-X header total
+    with an all-zero tail (exe-padded -> PADDED-EXE; a non-zero tail is
+    EXE-OVERSIZE-CAUTION, a short file EXE-UNDERSIZE-CAUTION), and
+    multi-disc sets whose discs boot different programs (multi-exe-set
+    -> MULTI-EXE-UNSUPPORTED). Track layout rides along as information
+    only - a single-track cue is how some discs were mastered, never a
+    failure flag. Additive only: no existing probe field changes.
+    Idempotent text patch on the template / framework cache and on
+    scaffolded projects (added 2026-11-12)."""
+    try:
+        probe = Path(template) / "psxrecomp" / "tools" / \
+            "new_project_layout" / "probe_disc.py"
+        if not probe.exists():
+            if fail_loud:
+                raise StageError(
+                    f"probe_disc.py missing under {template} - cannot "
+                    f"apply the pre-flight classification patch")
+            return
+        text = probe.read_text()
+        if PREFLIGHT_MARKER in text:
+            return
+        pairs = [(PREFLIGHT_OLD_0, PREFLIGHT_NEW_0), (PREFLIGHT_OLD_1, PREFLIGHT_NEW_1), (PREFLIGHT_OLD_2, PREFLIGHT_NEW_2), (PREFLIGHT_OLD_3, PREFLIGHT_NEW_3), (PREFLIGHT_OLD_4, PREFLIGHT_NEW_4), (PREFLIGHT_OLD_5, PREFLIGHT_NEW_5), (PREFLIGHT_OLD_6, PREFLIGHT_NEW_6), (PREFLIGHT_OLD_7, PREFLIGHT_NEW_7)]
+        missing = [i for i, (old, _n) in enumerate(pairs)
+                   if old not in text]
+        if missing:
+            if fail_loud:
+                raise StageError(
+                    f"probe_disc.py in {template} does NOT take "
+                    f"the pre-flight classification patch: "
+                    f"{len(missing)} of {len(pairs)} anchors missing "
+                    f"{missing} - this probe variant is not covered "
+                    f"by this tool version, and its probes would carry "
+                    f"no preflight section. Failing the job instead of "
+                    f"shipping it broken; update the tool or the "
+                    f"template.")
+            return
+        for old, new in pairs:
+            text = text.replace(old, new, 1)
+        probe.write_text(text)
+        log("patched probe_disc.py: pre-flight classification "
+            "(CLEAN / NEEDS-CLEAN-PATH / PADDED-EXE / "
+            "EXE-OVERSIZE-CAUTION / EXE-UNDERSIZE-CAUTION / "
+            "MULTI-EXE-UNSUPPORTED)")
+    except StageError:
+        raise
+    except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"pre-flight probe patch failed on "
+                f"{template}: {e}") from e
+        log(f"preflight probe patch skipped: {e}")
+
+
 def patch_overlay_draw_chain(template, log=print, fail_loud=False):
     """Let the in-game menu and the RetroAchievements pop-ups share the
     host overlay draw slot. Upstream host_overlay.c keeps ONE draw
@@ -986,6 +1070,88 @@ GL_GRID_OLD_34 = '        p_glVertexAttribPointer(11, 4, GL_FLOAT, GL_FALSE, st,
 
 GL_GRID_NEW_34 = '        p_glVertexAttribPointer(11, 4, GL_FLOAT, GL_FALSE, st, (void*)(21*sizeof(float))); p_glEnableVertexAttribArray(11); /* HD source */\n        p_glVertexAttribPointer(12, 1, GL_FLOAT, GL_FALSE, st, (void*)(25*sizeof(float))); p_glEnableVertexAttribArray(12); /* HD alpha mode */\n        p_glVertexAttribPointer(13, 1, GL_FLOAT, GL_FALSE, st, (void*)(26*sizeof(float))); p_glEnableVertexAttribArray(13); /* filter */\n        p_glVertexAttribPointer(14, 4, GL_FLOAT, GL_FALSE, st, (void*)(27*sizeof(float))); p_glEnableVertexAttribArray(14); /* gg record */\n    }\n\n    /* Guest-grid GEO VAO: attribs 0/1 read the shared s_geo_vbo exactly\n     * like s_geo_vao; attribs 2..7 read the side buffer (GG_STRIDE). */\n    if (s_geo_grid_prog) {\n        GLsizei gst = GG_STRIDE * sizeof(float);\n        p_glGenVertexArrays(1, &s_geo_grid_vao);\n        p_glBindVertexArray(s_geo_grid_vao);\n        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);\n        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);\n        p_glEnableVertexAttribArray(0);\n        p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)(2 * sizeof(float)));\n        p_glEnableVertexAttribArray(1);\n        p_glGenBuffers(1, &s_geo_grid_vbo);\n        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_grid_vbo);\n        p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, gst, (void *)0);                  p_glEnableVertexAttribArray(2); /* gg record */\n        fprintf(stdout, "psxrecomp: GL guest-grid coverage active (PSX_GL_GRID=0 disables)\\n");\n    } else {\n        fprintf(stdout, "psxrecomp: GL guest-grid GEO program unavailable; flat/gouraud grid disabled\\n");\n    }\n\n    p_glGenVertexArrays(1, &s_blit_vao);\n'
 
+GL_GRID_V2_MARKER = "guest pixel from gl_FragCoord (GL grid v2)"
+
+GL_GRID_V2_OLD_0 = " * queue replays above it. */\nstatic void geo_grid_draw(int nverts, int semi, int dmode, int mask, int check,\n                          int b3d, float shift, float xoff, float xhalf,\n                          float xscale, float xcenter,\n                          const float *fb, const float *fbg);\n/* Every flush call site is attributed (gl_renderer_batch_sites): a flush that\n * draws a non-empty batch counts against its caller's source line. */\nstatic void batch_site_note(int kind, int line);\n"
+
+GL_GRID_V2_NEW_0 = " * queue replays above it. */\nstatic void geo_grid_draw(int nverts, int semi, int dmode, int mask, int check,\n                          int b3d, float shift, float xoff, float xhalf,\n                          float xscale, float xcenter, int ggscale,\n                          const float *fb, const float *fbg);\n/* Guest-grid v2: set a program's guest origin/scale uniforms for the\n * draw target about to be drawn into. orgx is the guest x that window\n * column 0 of the target maps to (== -u_xoff of the draw); scale is\n * the target's host px per guest px. Defined with the gg CPU block. */\nstatic void gg_set_target(GLint uOrgx, GLint uScale, int orgx, int scale);\n/* Every flush call site is attributed (gl_renderer_batch_sites): a flush that\n * draws a non-empty batch counts against its caller's source line. */\nstatic void batch_site_note(int kind, int line);\n"
+
+GL_GRID_V2_OLD_1 = '             s_geog_uBcls = -1, s_geog_uBadd = -1,\n             s_geog_uDither = -1, s_geog_uAccurate = -1;\nstatic GLint s_tex_uCovviz = -1;\n/* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)\n * semi(1) q(1) twin(1) hd_source(4) hd_mode(1) filter(1) gg(4)\n * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch).\n'
+
+GL_GRID_V2_NEW_1 = '             s_geog_uBcls = -1, s_geog_uBadd = -1,\n             s_geog_uDither = -1, s_geog_uAccurate = -1;\nstatic GLint s_tex_uCovviz = -1;\n/* Guest-grid v2: per-target guest origin/scale uniform locations for the\n * two programs that run the ownership test (TEX + GEO_GRID). */\nstatic GLint s_tex_uGgOrgx = -1, s_tex_uGgScale = -1;\nstatic GLint s_geog_uGgOrgx = -1, s_geog_uGgScale = -1;\n/* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)\n * semi(1) q(1) twin(1) hd_source(4) hd_mode(1) filter(1) gg(4)\n * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch).\n'
+
+GL_GRID_V2_OLD_2 = ' * recomputes the steps with an emulated int64 division (schoolbook\n * base-2^16, exact in uint arithmetic; dy > 0 there, matching the\n * branches the C code evaluates).\n * Guest position comes from v_npos: with u_shift = 0.5/S - 1/64 the\n * interpolated value at a fragment centre is FBO_px/S + 1/64 on every\n * surface (hr, wide, window tiles) at every scale, so floor(v_npos)\n * is the fragment\'s guest pixel, scale- and surface-independent. */\n#define GG_GLSL \\\n    "int gg_edge_x(int fx, uvec2 step, int k){\\n" \\\n    "  uint slo = step.x, shi = step.y;\\n" \\\n'
+
+GL_GRID_V2_NEW_2 = ' * recomputes the steps with an emulated int64 division (schoolbook\n * base-2^16, exact in uint arithmetic; dy > 0 there, matching the\n * branches the C code evaluates).\n * Guest position (GL grid v2): the fragment\'s guest pixel is computed\n * from gl_FragCoord in integer arithmetic only (gg_guest_pixel below):\n * the draw target\'s guest origin (u_gg_orgx) and scale (u_gg_scale)\n * are per-draw uniforms set by the host wherever it sets u_xoff, and\n * orgx == -u_xoff holds at every draw site, so the map is exact on\n * every surface (hr, wide, window tiles) at every scale. v1 took the\n * guest pixel from floor(v_npos), a noperspective-interpolated\n * varying: exact on llvmpipe, but on NVIDIA hardware the interpolated\n * value deviates systematically by ~0.1-0.5 guest px on long thin\n * prims (growing toward the far end), flipping exactly the far-side\n * sub-row/sub-column of each guest block and splitting blocks between\n * rival prims (hardware COV_VIZ frame, 2026-11-11: 72% of the 3D view\n * multi-owned at 4x vs ~1% interiors on llvmpipe). gl_FragCoord is\n * the fragment\'s own window position — never interpolated — so the\n * v2 map does not depend on any float rounding mode. v_npos remains\n * in use for dithering only. (guest pixel from gl_FragCoord (GL grid v2)) */\n#define GG_GLSL \\\n    "int gg_edge_x(int fx, uvec2 step, int k){\\n" \\\n    "  uint slo = step.x, shi = step.y;\\n" \\\n'
+
+GL_GRID_V2_OLD_3 = '    "                      : gg_edge_x(p1.x, s2, g.y - p0.z);\\n" \\\n    "  int lo = min(xa, xb), hi = max(xa, xb);\\n" \\\n    "  return g.x >= lo && g.x < hi;\\n" \\\n    "}\\n" \\\n    "vec3 gg_hash_colour(ivec3 p0, ivec2 p1, uvec2 sl){\\n" \\\n    "  uint h = uint(p0.x * 73856093) ^ uint(p0.y * 19349663) ^ uint(p1.x * 83492791) ^ sl.x ^ (sl.y << 7);\\n" \\\n'
+
+GL_GRID_V2_NEW_3 = '    "                      : gg_edge_x(p1.x, s2, g.y - p0.z);\\n" \\\n    "  int lo = min(xa, xb), hi = max(xa, xb);\\n" \\\n    "  return g.x >= lo && g.x < hi;\\n" \\\n    "}\\n" \\\n    "uniform int u_gg_orgx;   /* guest x at this target\'s window column 0 */\\n" \\\n    "uniform int u_gg_scale;  /* target scale: host px per guest px */\\n" \\\n    "ivec2 gg_guest_pixel(){\\n" \\\n    "  ivec2 fc = ivec2(gl_FragCoord.xy - 0.5);\\n" \\\n    "  int sc = u_gg_scale > 0 ? u_gg_scale : 1;\\n" \\\n    "  return ivec2(u_gg_orgx + fc.x / sc, fc.y / sc);\\n" \\\n    "}\\n" \\\n    "vec3 gg_hash_colour(ivec3 p0, ivec2 p1, uvec2 sl){\\n" \\\n    "  uint h = uint(p0.x * 73856093) ^ uint(p0.y * 19349663) ^ uint(p1.x * 83492791) ^ sl.x ^ (sl.y << 7);\\n" \\\n'
+
+GL_GRID_V2_OLD_4 = '    PSX_DITHER_GLSL\n    GG_GLSL\n    "void main(){\\n"\n    "  if (!gg_owned(ivec2(floor(v_npos)), v_gg_p0, v_gg_p1, v_gg_sl, v_gg_s1, v_gg_s2)) discard;\\n"\n    "  if (u_bcls != 0) { if (u_bcls == 1 && !(v_b3d > 0.999 || u_badd != 0)) discard; frag = vec4(0.0); return; }\\n"\n    "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\\n"\n    "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\\n";\n'
+
+GL_GRID_V2_NEW_4 = '    PSX_DITHER_GLSL\n    GG_GLSL\n    "void main(){\\n"\n    "  if (!gg_owned(gg_guest_pixel(), v_gg_p0, v_gg_p1, v_gg_sl, v_gg_s1, v_gg_s2)) discard;\\n"\n    "  if (u_bcls != 0) { if (u_bcls == 1 && !(v_b3d > 0.999 || u_badd != 0)) discard; frag = vec4(0.0); return; }\\n"\n    "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\\n"\n    "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\\n";\n'
+
+GL_GRID_V2_OLD_5 = '    "   * not own (per the native DDA spans) does not exist. Runs before\\n"\n    "   * every sampling/blend decision so all passes (colour, STP split,\\n"\n    "   * stencil fixup, bloom marking) agree on coverage exactly. */\\n"\n    "  if (v_gg_on != 0 && !gg_owned(ivec2(floor(v_npos)), v_gg_p0, v_gg_p1, v_gg_sl, v_gg_s1, v_gg_s2)) discard;\\n"\n    "  if (u_covviz != 0) { frag = vec4(gg_hash_colour(v_gg_p0, v_gg_p1, v_gg_sl), 1.0); blend_factor = vec4(0.0); return; }\\n"\n    "  int stp; vec3 rgb;\\n"\n    "  int fmode = v_filter & 15;\\n"\n'
+
+GL_GRID_V2_NEW_5 = '    "   * not own (per the native DDA spans) does not exist. Runs before\\n"\n    "   * every sampling/blend decision so all passes (colour, STP split,\\n"\n    "   * stencil fixup, bloom marking) agree on coverage exactly. */\\n"\n    "  if (v_gg_on != 0 && !gg_owned(gg_guest_pixel(), v_gg_p0, v_gg_p1, v_gg_sl, v_gg_s1, v_gg_s2)) discard;\\n"\n    "  if (u_covviz != 0) { frag = vec4(gg_hash_colour(v_gg_p0, v_gg_p1, v_gg_sl), 1.0); blend_factor = vec4(0.0); return; }\\n"\n    "  int stp; vec3 rgb;\\n"\n    "  int fmode = v_filter & 15;\\n"\n'
+
+GL_GRID_V2_OLD_6 = '    wide_band_scissor_x(view_pad_left, g_wide_w - view_pad_left - view_pad_right);\n    p_glUniform1f(uXoff, (float)dx);\n    p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);\n}\nstatic void wide_target_end(GLint uXoff, GLint uXhalf) {\n    if (s_hiw)\n        p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hr);\n    p_glUniform1f(uXoff, 0.0f);\n    p_glUniform1f(uXhalf, 512.0f);\n    if (s_ws_ablate != 3)\n        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);\n}\n'
+
+GL_GRID_V2_NEW_6 = '    wide_band_scissor_x(view_pad_left, g_wide_w - view_pad_left - view_pad_right);\n    p_glUniform1f(uXoff, (float)dx);\n    p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);\n    if (uXoff == s_tex_uXoff)   /* guest-grid v2: wide surface, s_out_scale */\n        gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, -dx, s_out_scale);\n}\nstatic void wide_target_end(GLint uXoff, GLint uXhalf) {\n    if (s_hiw)\n        p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hr);\n    p_glUniform1f(uXoff, 0.0f);\n    p_glUniform1f(uXhalf, 512.0f);\n    if (uXoff == s_tex_uXoff)   /* guest-grid v2: back on the hr surface */\n        gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, 0, s_hr_scale);\n    if (s_ws_ablate != 3)\n        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);\n}\n'
+
+GL_GRID_V2_OLD_7 = '                cur = HQ_TEX;\n            }\n            p_glUniform1f(s_tex_uXoff, (float)c->wdx);\n            p_glUniform1f(s_tex_uXscale, c->wscale);\n            p_glUniform1f(s_tex_uXcenter, c->wcenter);\n            bind_textured_resources(c->tex, c->palette, c->hd_tex);\n'
+
+GL_GRID_V2_NEW_7 = '                cur = HQ_TEX;\n            }\n            p_glUniform1f(s_tex_uXoff, (float)c->wdx);\n            gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, -c->wdx, s_out_scale);\n            p_glUniform1f(s_tex_uXscale, c->wscale);\n            p_glUniform1f(s_tex_uXcenter, c->wcenter);\n            bind_textured_resources(c->tex, c->palette, c->hd_tex);\n'
+
+GL_GRID_V2_OLD_8 = '            mask_stencil_ex(c->mask, c->check);\n            geo_grid_draw(c->vcount, c->semi, 0, c->mask, c->check, -1,\n                          s_shift_hi, (float)c->wdx, (float)g_wide_w / 2.0f,\n                          c->wscale, c->wcenter,\n                          s_hq_v + c->vfirst, s_hq_g + c->gfirst);\n            cur = 0;   /* the grid draw bound its own program/VAO */\n        } else {\n'
+
+GL_GRID_V2_NEW_8 = '            mask_stencil_ex(c->mask, c->check);\n            geo_grid_draw(c->vcount, c->semi, 0, c->mask, c->check, -1,\n                          s_shift_hi, (float)c->wdx, (float)g_wide_w / 2.0f,\n                          c->wscale, c->wcenter, s_out_scale,\n                          s_hq_v + c->vfirst, s_hq_g + c->gfirst);\n            cur = 0;   /* the grid draw bound its own program/VAO */\n        } else {\n'
+
+GL_GRID_V2_OLD_9 = '                p_glUniform1f(s_tex_uShift, s_shift_hi);\n                p_glUniform1f(s_tex_uXoff, (float)(-T->x0));\n                p_glUniform1f(s_tex_uXhalf, (float)ww / 2.0f);\n                p_glUniform1i(s_uVram, 0);\n                p_glActiveTexture(PSXGL_TEXTURE0);\n                bound = 1;\n'
+
+GL_GRID_V2_NEW_9 = '                p_glUniform1f(s_tex_uShift, s_shift_hi);\n                p_glUniform1f(s_tex_uXoff, (float)(-T->x0));\n                p_glUniform1f(s_tex_uXhalf, (float)ww / 2.0f);\n                gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, T->x0, s_out_scale);\n                p_glUniform1i(s_uVram, 0);\n                p_glActiveTexture(PSXGL_TEXTURE0);\n                bound = 1;\n'
+
+GL_GRID_V2_OLD_10 = '                if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);\n                mask_stencil_ex(c->mask, c->check);\n                geo_grid_draw(c->vcount, c->semi, 0, c->mask, c->check, -1,\n                              s_shift_hi, (float)(-T->x0), (float)ww / 2.0f, 1.0f, 0.0f,\n                              s_hq_v + c->vfirst, s_hq_g + c->gfirst);\n                cur = 0;   /* the grid draw bound its own program/VAO */\n            } else {\n'
+
+GL_GRID_V2_NEW_10 = '                if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);\n                mask_stencil_ex(c->mask, c->check);\n                geo_grid_draw(c->vcount, c->semi, 0, c->mask, c->check, -1,\n                              s_shift_hi, (float)(-T->x0), (float)ww / 2.0f, 1.0f, 0.0f, s_out_scale,\n                              s_hq_v + c->vfirst, s_hq_g + c->gfirst);\n                cur = 0;   /* the grid draw bound its own program/VAO */\n            } else {\n'
+
+GL_GRID_V2_OLD_11 = '    p_glUniform1f(s_tex_uShift, s_shift_hr);\n    p_glUniform1f(s_tex_uXoff, 0.0f);\n    p_glUniform1f(s_tex_uXhalf, 512.0f);\n    hr_end();\n    /* Native-wide only: leave the hr surface bound, as an immediate mirror\n     * (wide_target_end) does. */\n'
+
+GL_GRID_V2_NEW_11 = '    p_glUniform1f(s_tex_uShift, s_shift_hr);\n    p_glUniform1f(s_tex_uXoff, 0.0f);\n    p_glUniform1f(s_tex_uXhalf, 512.0f);\n    gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, 0, s_hr_scale);\n    hr_end();\n    /* Native-wide only: leave the hr surface bound, as an immediate mirror\n     * (wide_target_end) does. */\n'
+
+GL_GRID_V2_OLD_12 = ' * uniform locations swapped into the shared globals for the duration. */\nstatic void geo_grid_draw(int nverts, int semi, int dmode, int mask, int check,\n                          int b3d, float shift, float xoff, float xhalf,\n                          float xscale, float xcenter,\n                          const float *fb, const float *fbg) {\n    p_glUseProgram(s_geo_grid_prog);\n    p_glUniform1f(s_geog_uShift, shift);\n    p_glUniform1f(s_geog_uXoff, xoff);\n    p_glUniform1f(s_geog_uXhalf, xhalf);\n'
+
+GL_GRID_V2_NEW_12 = ' * uniform locations swapped into the shared globals for the duration. */\nstatic void geo_grid_draw(int nverts, int semi, int dmode, int mask, int check,\n                          int b3d, float shift, float xoff, float xhalf,\n                          float xscale, float xcenter, int ggscale,\n                          const float *fb, const float *fbg) {\n    p_glUseProgram(s_geo_grid_prog);\n    gg_set_target(s_geog_uGgOrgx, s_geog_uGgScale, -(int)xoff, ggscale);\n    p_glUniform1f(s_geog_uShift, shift);\n    p_glUniform1f(s_geog_uXoff, xoff);\n    p_glUniform1f(s_geog_uXhalf, xhalf);\n'
+
+GL_GRID_V2_OLD_13 = '    mask_stencil(mask);\n    if (grid) {\n        geo_grid_draw(nverts, semi, dmode, mask, s_mask_check, b3d,\n                      s_shift_hr, 0.0f, 512.0f, 1.0f, 0.0f, s_fb, s_fbg);\n    } else {\n        if (fmode == GL_LINES) glLineWidth((float)s_hr_scale);\n        p_glUseProgram(s_geo_prog);\n'
+
+GL_GRID_V2_NEW_13 = '    mask_stencil(mask);\n    if (grid) {\n        geo_grid_draw(nverts, semi, dmode, mask, s_mask_check, b3d,\n                      s_shift_hr, 0.0f, 512.0f, 1.0f, 0.0f, s_hr_scale, s_fb, s_fbg);\n    } else {\n        if (fmode == GL_LINES) glLineWidth((float)s_hr_scale);\n        p_glUseProgram(s_geo_prog);\n'
+
+GL_GRID_V2_OLD_14 = '            if (s_ws_ablate != 2)\n                geo_grid_draw(nverts, semi, dmode, mask, s_mask_check, b3d,\n                              s_hiw ? s_shift_hi : s_shift_hr, (float)dx,\n                              (float)g_wide_w / 2.0f, sc, ce, s_fb, s_fbg);\n            if (s_ws_ablate != 3) p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);\n        } else {\n            wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);\n'
+
+GL_GRID_V2_NEW_14 = '            if (s_ws_ablate != 2)\n                geo_grid_draw(nverts, semi, dmode, mask, s_mask_check, b3d,\n                              s_hiw ? s_shift_hi : s_shift_hr, (float)dx,\n                              (float)g_wide_w / 2.0f, sc, ce, s_out_scale, s_fb, s_fbg);\n            if (s_ws_ablate != 3) p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);\n        } else {\n            wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);\n'
+
+GL_GRID_V2_OLD_15 = '    static int on = -1;\n    if (on < 0) { const char *e = getenv("PSX_GL_COV_VIZ"); on = (e && e[0] == \'1\'); }\n    return on;\n}\n/* Pack one prim\'s guest-grid record (GG_STRIDE floats; one layout for\n * the TEX slots 27.. and the GEO side array): sort the guest verts by Y\n'
+
+GL_GRID_V2_NEW_15 = '    static int on = -1;\n    if (on < 0) { const char *e = getenv("PSX_GL_COV_VIZ"); on = (e && e[0] == \'1\'); }\n    return on;\n}\n/* Guest-grid v2: point a program\'s ownership test at the draw target\n * being drawn into. The matching program must be in use, as for every\n * other uniform write in this file. A location of -1 (program without\n * the test) is ignored by glUniform, as elsewhere. */\nstatic void gg_set_target(GLint uOrgx, GLint uScale, int orgx, int scale) {\n    p_glUniform1i(uOrgx, orgx);\n    p_glUniform1i(uScale, scale > 0 ? scale : 1);\n}\n/* Pack one prim\'s guest-grid record (GG_STRIDE floats; one layout for\n * the TEX slots 27.. and the GEO side array): sort the guest verts by Y\n'
+
+GL_GRID_V2_OLD_16 = '        s_geo_uZbias = p_glGetUniformLocation(s_geo_prog, "u_zbias");\n        s_tex_uZbias = p_glGetUniformLocation(s_tex_prog, "u_zbias");\n        s_tex_uCovviz = p_glGetUniformLocation(s_tex_prog, "u_covviz");\n        if (s_geo_grid_prog) {\n            s_geog_uShift = p_glGetUniformLocation(s_geo_grid_prog, "u_shift");\n            s_geog_uXoff = p_glGetUniformLocation(s_geo_grid_prog, "u_xoff");\n'
+
+GL_GRID_V2_NEW_16 = '        s_geo_uZbias = p_glGetUniformLocation(s_geo_prog, "u_zbias");\n        s_tex_uZbias = p_glGetUniformLocation(s_tex_prog, "u_zbias");\n        s_tex_uCovviz = p_glGetUniformLocation(s_tex_prog, "u_covviz");\n        s_tex_uGgOrgx = p_glGetUniformLocation(s_tex_prog, "u_gg_orgx");\n        s_tex_uGgScale = p_glGetUniformLocation(s_tex_prog, "u_gg_scale");\n        if (s_geo_grid_prog) {\n            s_geog_uShift = p_glGetUniformLocation(s_geo_grid_prog, "u_shift");\n            s_geog_uXoff = p_glGetUniformLocation(s_geo_grid_prog, "u_xoff");\n'
+
+GL_GRID_V2_OLD_17 = '            s_geog_uBadd = p_glGetUniformLocation(s_geo_grid_prog, "u_badd");\n            s_geog_uDither = p_glGetUniformLocation(s_geo_grid_prog, "u_dither");\n            s_geog_uAccurate = p_glGetUniformLocation(s_geo_grid_prog, "u_accurate");\n        }\n        p_glUseProgram(s_geo_prog);\n        p_glUniform1f(s_geo_uShift, shift);\n'
+
+GL_GRID_V2_NEW_17 = '            s_geog_uBadd = p_glGetUniformLocation(s_geo_grid_prog, "u_badd");\n            s_geog_uDither = p_glGetUniformLocation(s_geo_grid_prog, "u_dither");\n            s_geog_uAccurate = p_glGetUniformLocation(s_geo_grid_prog, "u_accurate");\n            s_geog_uGgOrgx = p_glGetUniformLocation(s_geo_grid_prog, "u_gg_orgx");\n            s_geog_uGgScale = p_glGetUniformLocation(s_geo_grid_prog, "u_gg_scale");\n        }\n        p_glUseProgram(s_geo_prog);\n        p_glUniform1f(s_geo_uShift, shift);\n'
+
+GL_GRID_V2_OLD_18 = '        p_glUniform1f(s_tex_uShift, shift);\n        p_glUniform1f(s_tex_uXoff, 0.0f);\n        p_glUniform1f(s_tex_uXhalf, 512.0f);\n        p_glUniform1i(s_tex_uCovviz, gg_covviz() ? 1 : 0);\n        p_glUseProgram(s_blit_prog);\n        p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);\n'
+
+GL_GRID_V2_NEW_18 = '        p_glUniform1f(s_tex_uShift, shift);\n        p_glUniform1f(s_tex_uXoff, 0.0f);\n        p_glUniform1f(s_tex_uXhalf, 512.0f);\n        gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, 0, s_hr_scale);\n        p_glUniform1i(s_tex_uCovviz, gg_covviz() ? 1 : 0);\n        p_glUseProgram(s_blit_prog);\n        p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);\n'
+
+GL_GRID_V2_OLD_19 = '    s_shift_hr = s_shift_hi = 0.5f / (float)snew - 1.0f / 64.0f;\n    p_glUseProgram(s_geo_prog);  p_glUniform1f(s_geo_uShift, s_shift_hr);\n    p_glUseProgram(s_tex_prog);  p_glUniform1f(s_tex_uShift, s_shift_hr);\n    p_glUseProgram(s_blit_prog);\n    p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), s_shift_hr);\n    p_glUseProgram(0);\n'
+
+GL_GRID_V2_NEW_19 = '    s_shift_hr = s_shift_hi = 0.5f / (float)snew - 1.0f / 64.0f;\n    p_glUseProgram(s_geo_prog);  p_glUniform1f(s_geo_uShift, s_shift_hr);\n    p_glUseProgram(s_tex_prog);  p_glUniform1f(s_tex_uShift, s_shift_hr);\n    gg_set_target(s_tex_uGgOrgx, s_tex_uGgScale, 0, snew);\n    p_glUseProgram(s_blit_prog);\n    p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), s_shift_hr);\n    p_glUseProgram(0);\n'
+
 def patch_gl_guest_grid(template, log=print, fail_loud=False):
     """Fix hi-res coverage in the OpenGL renderer: guest-pixel
     ownership test in the fragment shader, replicating the native
@@ -1033,6 +1199,21 @@ def patch_gl_guest_grid(template, log=print, fail_loud=False):
     footprint check 4.6/255; PGXP-on captures unchanged in class.
     Idempotent text patch on the template / framework cache and
     on scaffolded projects (found 2026-11-06).
+
+    v2 phase (2026-11-11): the guest pixel is no longer read from
+    the interpolated noperspective varying (floor(v_npos)). On
+    NVIDIA hardware that interpolation deviates systematically by
+    ~0.1-0.5 guest px on long thin prims, splitting guest blocks
+    between rival prims (hardware COV_VIZ: 72% of the 3D view
+    multi-owned at 4x, vs ~1% interiors on llvmpipe). v2 computes
+    the guest pixel from gl_FragCoord in pure integer arithmetic
+    (guest = u_gg_orgx + (fragcoord - 0.5) / u_gg_scale), with
+    per-draw origin/scale uniforms set wherever the host sets
+    u_xoff (orgx == -u_xoff at every site; hr surface at
+    s_hr_scale, wide surfaces and window tiles at s_out_scale).
+    The DDA ownership rule itself is unchanged. The v2 phase
+    applies on top of a v1-patched tree (marker-gated), so trees
+    converted with v1.0.19 upgrade in place on their next run.
     """
     try:
         src = Path(template) / "psxrecomp" / "runtime" / "src" / \
@@ -1044,29 +1225,49 @@ def patch_gl_guest_grid(template, log=print, fail_loud=False):
                     f"cannot apply the OpenGL guest-grid patch")
             return
         text = src.read_text()
-        if GL_GRID_MARKER in text:
-            return
-        pairs = [(GL_GRID_OLD_0, GL_GRID_NEW_0), (GL_GRID_OLD_1, GL_GRID_NEW_1), (GL_GRID_OLD_2, GL_GRID_NEW_2), (GL_GRID_OLD_3, GL_GRID_NEW_3), (GL_GRID_OLD_4, GL_GRID_NEW_4), (GL_GRID_OLD_5, GL_GRID_NEW_5), (GL_GRID_OLD_6, GL_GRID_NEW_6), (GL_GRID_OLD_7, GL_GRID_NEW_7), (GL_GRID_OLD_8, GL_GRID_NEW_8), (GL_GRID_OLD_9, GL_GRID_NEW_9), (GL_GRID_OLD_10, GL_GRID_NEW_10), (GL_GRID_OLD_11, GL_GRID_NEW_11), (GL_GRID_OLD_12, GL_GRID_NEW_12), (GL_GRID_OLD_13, GL_GRID_NEW_13), (GL_GRID_OLD_14, GL_GRID_NEW_14), (GL_GRID_OLD_15, GL_GRID_NEW_15), (GL_GRID_OLD_16, GL_GRID_NEW_16), (GL_GRID_OLD_17, GL_GRID_NEW_17), (GL_GRID_OLD_18, GL_GRID_NEW_18), (GL_GRID_OLD_19, GL_GRID_NEW_19), (GL_GRID_OLD_20, GL_GRID_NEW_20), (GL_GRID_OLD_21, GL_GRID_NEW_21), (GL_GRID_OLD_22, GL_GRID_NEW_22), (GL_GRID_OLD_23, GL_GRID_NEW_23), (GL_GRID_OLD_24, GL_GRID_NEW_24), (GL_GRID_OLD_25, GL_GRID_NEW_25), (GL_GRID_OLD_26, GL_GRID_NEW_26), (GL_GRID_OLD_27, GL_GRID_NEW_27), (GL_GRID_OLD_28, GL_GRID_NEW_28), (GL_GRID_OLD_29, GL_GRID_NEW_29), (GL_GRID_OLD_30, GL_GRID_NEW_30), (GL_GRID_OLD_31, GL_GRID_NEW_31), (GL_GRID_OLD_32, GL_GRID_NEW_32), (GL_GRID_OLD_33, GL_GRID_NEW_33), (GL_GRID_OLD_34, GL_GRID_NEW_34)]
-        missing = [i for i, (old, _n) in enumerate(pairs)
-                   if old not in text]
-        if missing:
-            if fail_loud:
-                raise StageError(
-                    f"gpu_gl_renderer.c in {template} does NOT take "
-                    f"the OpenGL guest-grid patch: {len(missing)} "
-                    f"of {len(pairs)} anchors missing {missing} - "
-                    f"this renderer variant is not covered by this "
-                    f"tool version, and the game would ship WITHOUT "
-                    f"the Doom / Final Doom striping fix (OpenGL "
-                    f"renderer). Failing the job instead of shipping "
-                    f"it broken; update the tool or the template.")
-            return
-        for old, new in pairs:
-            text = text.replace(old, new, 1)
-        src.write_text(text)
-        log("patched gpu_gl_renderer.c: guest-grid coverage for "
-            "hi-res OpenGL rendering (Doom / Final Doom striping "
-            "fix; OpenGL renderer)")
+        orig = text
+        if GL_GRID_MARKER not in text:
+            pairs = [(GL_GRID_OLD_0, GL_GRID_NEW_0), (GL_GRID_OLD_1, GL_GRID_NEW_1), (GL_GRID_OLD_2, GL_GRID_NEW_2), (GL_GRID_OLD_3, GL_GRID_NEW_3), (GL_GRID_OLD_4, GL_GRID_NEW_4), (GL_GRID_OLD_5, GL_GRID_NEW_5), (GL_GRID_OLD_6, GL_GRID_NEW_6), (GL_GRID_OLD_7, GL_GRID_NEW_7), (GL_GRID_OLD_8, GL_GRID_NEW_8), (GL_GRID_OLD_9, GL_GRID_NEW_9), (GL_GRID_OLD_10, GL_GRID_NEW_10), (GL_GRID_OLD_11, GL_GRID_NEW_11), (GL_GRID_OLD_12, GL_GRID_NEW_12), (GL_GRID_OLD_13, GL_GRID_NEW_13), (GL_GRID_OLD_14, GL_GRID_NEW_14), (GL_GRID_OLD_15, GL_GRID_NEW_15), (GL_GRID_OLD_16, GL_GRID_NEW_16), (GL_GRID_OLD_17, GL_GRID_NEW_17), (GL_GRID_OLD_18, GL_GRID_NEW_18), (GL_GRID_OLD_19, GL_GRID_NEW_19), (GL_GRID_OLD_20, GL_GRID_NEW_20), (GL_GRID_OLD_21, GL_GRID_NEW_21), (GL_GRID_OLD_22, GL_GRID_NEW_22), (GL_GRID_OLD_23, GL_GRID_NEW_23), (GL_GRID_OLD_24, GL_GRID_NEW_24), (GL_GRID_OLD_25, GL_GRID_NEW_25), (GL_GRID_OLD_26, GL_GRID_NEW_26), (GL_GRID_OLD_27, GL_GRID_NEW_27), (GL_GRID_OLD_28, GL_GRID_NEW_28), (GL_GRID_OLD_29, GL_GRID_NEW_29), (GL_GRID_OLD_30, GL_GRID_NEW_30), (GL_GRID_OLD_31, GL_GRID_NEW_31), (GL_GRID_OLD_32, GL_GRID_NEW_32), (GL_GRID_OLD_33, GL_GRID_NEW_33), (GL_GRID_OLD_34, GL_GRID_NEW_34)]
+            missing = [i for i, (old, _n) in enumerate(pairs)
+                       if old not in text]
+            if missing:
+                if fail_loud:
+                    raise StageError(
+                        f"gpu_gl_renderer.c in {template} does NOT take "
+                        f"the OpenGL guest-grid patch: {len(missing)} "
+                        f"of {len(pairs)} anchors missing {missing} - "
+                        f"this renderer variant is not covered by this "
+                        f"tool version, and the game would ship WITHOUT "
+                        f"the Doom / Final Doom striping fix (OpenGL "
+                        f"renderer). Failing the job instead of shipping "
+                        f"it broken; update the tool or the template.")
+                return
+            for old, new in pairs:
+                text = text.replace(old, new, 1)
+        if GL_GRID_V2_MARKER not in text:
+            pairs2 = [(GL_GRID_V2_OLD_0, GL_GRID_V2_NEW_0), (GL_GRID_V2_OLD_1, GL_GRID_V2_NEW_1), (GL_GRID_V2_OLD_2, GL_GRID_V2_NEW_2), (GL_GRID_V2_OLD_3, GL_GRID_V2_NEW_3), (GL_GRID_V2_OLD_4, GL_GRID_V2_NEW_4), (GL_GRID_V2_OLD_5, GL_GRID_V2_NEW_5), (GL_GRID_V2_OLD_6, GL_GRID_V2_NEW_6), (GL_GRID_V2_OLD_7, GL_GRID_V2_NEW_7), (GL_GRID_V2_OLD_8, GL_GRID_V2_NEW_8), (GL_GRID_V2_OLD_9, GL_GRID_V2_NEW_9), (GL_GRID_V2_OLD_10, GL_GRID_V2_NEW_10), (GL_GRID_V2_OLD_11, GL_GRID_V2_NEW_11), (GL_GRID_V2_OLD_12, GL_GRID_V2_NEW_12), (GL_GRID_V2_OLD_13, GL_GRID_V2_NEW_13), (GL_GRID_V2_OLD_14, GL_GRID_V2_NEW_14), (GL_GRID_V2_OLD_15, GL_GRID_V2_NEW_15), (GL_GRID_V2_OLD_16, GL_GRID_V2_NEW_16), (GL_GRID_V2_OLD_17, GL_GRID_V2_NEW_17), (GL_GRID_V2_OLD_18, GL_GRID_V2_NEW_18), (GL_GRID_V2_OLD_19, GL_GRID_V2_NEW_19)]
+            missing2 = [i for i, (old, _n) in enumerate(pairs2)
+                        if old not in text]
+            if missing2:
+                if fail_loud:
+                    raise StageError(
+                        f"gpu_gl_renderer.c in {template} does NOT take "
+                        f"the OpenGL guest-grid v2 phase: {len(missing2)} "
+                        f"of {len(pairs2)} anchors missing {missing2} - "
+                        f"this v1-patched renderer variant is not "
+                        f"covered by the v2 phase (gl_FragCoord "
+                        f"integer guest pixel; NVIDIA interpolation "
+                        f"fix). Failing the job instead of shipping "
+                        f"it without the v2 fix; update the tool or "
+                        f"the template.")
+                return
+            for old, new in pairs2:
+                text = text.replace(old, new, 1)
+        if text != orig:
+            src.write_text(text)
+            log("patched gpu_gl_renderer.c: guest-grid coverage for "
+                "hi-res OpenGL rendering (Doom / Final Doom striping "
+                "fix; OpenGL renderer, grid v2)")
     except StageError:
         raise
     except Exception as e:  # a patch failure must never break a run
@@ -1079,6 +1280,8 @@ def patch_gl_guest_grid(template, log=print, fail_loud=False):
 def probe_cue(runner, cue, template, players=1, json_out=None):
     patch_probe_subdir_boot(template,
                             getattr(runner, "log", print))
+    patch_probe_preflight(template,
+                          getattr(runner, "log", print))
     probe = template / "psxrecomp" / "tools" / "new_project_layout" / "probe_disc.py"
     out = json_out or (Path(cue).parent / (Path(cue).stem + ".probe.json"))
     runner.run_ok(["python3", probe, "--json-out", out, "--players", players, cue],
@@ -2339,6 +2542,49 @@ def stage_package(r, job):
         st = stage / "mods" / "state.toml"
         if st.exists():
             st.unlink()
+        # Guard fold-in: stage the boot EXE the game.toml exe= line
+        # names, plus the framework licenses/ folder. Without
+        # disc/<boot exe> the runtime text-image guard has no local
+        # reference image to validate against; without
+        # licenses/psxrecomp-LICENSE, find_project_root() cannot pin
+        # the package as its own root and walks to a marker ancestor,
+        # resolving every relative path (the EXE included) against
+        # the wrong folder. Either absence leaves the guard unarmed
+        # on a real install, so a package that cannot arm fails here
+        # instead of shipping.
+        boot_exe = job.probes[0]["boot_exe"]
+        disc_src = repo / "disc" / boot_exe
+        if not disc_src.is_file():
+            raise StageError(
+                f"boot EXE missing from project tree: {disc_src} "
+                f"(game.toml names disc/{boot_exe})")
+        disc_dst = stage / "disc" / boot_exe
+        disc_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(disc_src, disc_dst)
+        fw = framework_cache()
+        lic = stage / "licenses"
+        lic.mkdir(exist_ok=True)
+        notices = fw / "psxrecomp" / "runtime" / "licenses"
+        if notices.is_dir():
+            for f in sorted(notices.iterdir()):
+                if f.is_file():
+                    shutil.copy2(f, lic / f.name)
+        for src_file, dst_name in (
+                (fw / "psxrecomp" / "THIRD_PARTY_ATTRIBUTION.md",
+                 "THIRD_PARTY_ATTRIBUTION.md"),
+                (fw / "psxrecomp" / "LICENSE", "psxrecomp-LICENSE"),
+                (fw / "psxrecomp" / "PERMISSIONS.md",
+                 "psxrecomp-PERMISSIONS.md"),
+                (fw / "recomp-ui" / "LICENSE", "recomp-ui-LICENSE")):
+            if src_file.is_file():
+                shutil.copy2(src_file, lic / dst_name)
+        if not disc_dst.is_file() \
+                or not (lic / "psxrecomp-LICENSE").is_file():
+            raise StageError(
+                f"guard staging incomplete for {name} ({osname}): "
+                f"disc/{boot_exe} or licenses/psxrecomp-LICENSE "
+                f"missing from the staged package")
+        r.log(f"staged guard files: disc/{boot_exe} + licenses/")
         if s.ra_enabled:
             shutil.copy2(repo / "retroachievements.toml.example", stage)
             if s.ra_toml_path and Path(s.ra_toml_path).exists():
@@ -2437,6 +2683,7 @@ def run_job(job, log, stop_after=None):
                          "that git is installed)")
     log(f"template project: {template}")
     patch_probe_subdir_boot(template, log, fail_loud=True)
+    patch_probe_preflight(template, log, fail_loud=True)
     patch_overlay_draw_chain(template, log, fail_loud=True)
     patch_cdrom_getlocp(template, log, fail_loud=True)
     patch_gpu_depth24_span(template, log, fail_loud=True)
@@ -2484,6 +2731,8 @@ def run_job(job, log, stop_after=None):
         ("scaffold", lambda: (stage_scaffold(r, job, template),
                               patch_probe_subdir_boot(job.repo, log,
                                                   fail_loud=True),
+                              patch_probe_preflight(job.repo, log,
+                                                    fail_loud=True),
                               patch_overlay_draw_chain(job.repo, log,
                                                   fail_loud=True),
                               patch_cdrom_getlocp(job.repo, log,
