@@ -43,6 +43,43 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.22 (2026-11-12)** — Packages can arm the text-image
+  guard, pre-flight probe classification, and the OpenGL
+  guest-grid v2 phase. (1) Guard packaging: stage_package now
+  ships the boot EXE at the path game.toml names
+  (disc/<boot exe>) plus the framework licenses/ folder.
+  Without them the runtime text-image guard has no local
+  reference image to validate against — and without the
+  license pin the package root resolves against the wrong
+  folder — so shipped packages left the guard unarmed and
+  runtime-loaded code fell back to slow interpretation (the
+  Tekken 3 stutter class). A package that cannot stage both
+  now fails at packaging instead of shipping unarmed. Re-run
+  games under this version to pick the fix up. (2) Pre-flight:
+  every probe result now carries a `preflight` section
+  classifying the disc before anything builds — CLEAN,
+  NEEDS-CLEAN-PATH (a shell-hostile character in the display
+  name; the apostrophe in Tony Hawk's / Director's Cut is the
+  known killer), PADDED-EXE (boot EXE larger than its header
+  total with an all-zero tail — mastered-in padding, Twisted
+  Metal III), EXE-OVERSIZE-CAUTION (non-zero tail — not
+  assumed padding), EXE-UNDERSIZE-CAUTION, and
+  MULTI-EXE-UNSUPPORTED (a disc set whose discs boot
+  different programs — the Xenogears class; classify a whole
+  set with the probe's new --disc-set-cue / --disc-set-list
+  options). Track layout is reported as information only: a
+  single-track cue is how some discs were mastered, never a
+  failure flag. (3) OpenGL guest-grid v2: the fragment
+  shader's guest pixel is computed from gl_FragCoord in
+  integer arithmetic instead of an interpolated varying that
+  deviates systematically on NVIDIA hardware. Honest status
+  for Doom-engine games: combing still shows when OpenGL is
+  scaled above 1x — use the Software renderer, or OpenGL at
+  1x (native scale). The DDA ownership rule itself is
+  unchanged, and v2 applies on top of v1-patched trees, so
+  games converted with v1.0.19 upgrade in place on their
+  next run.
+
 - **v1.0.21 (2026-11-07)** — Add Library Folder, plus two
   probe-chain fixes its stress test caught. (1) Add Library
   Folder: a third add control beside "Add Disc" and "Add Disc
