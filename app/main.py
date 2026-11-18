@@ -164,6 +164,24 @@ waiting list until its own result arrives. This covers "Add
 Disc" and "Add Disc Set" too - every add shares the same
 chain.
 
+CONVERSIONS THAT FAILED BEFORE THEY STARTED (FIXED IN v1.0.23)
+Every conversion begins by scaffolding a fresh project from the
+PSXRecomp framework. The framework's setup script downloaded the
+framework from GitHub at whatever revision was newest that day,
+so the same version of this tool could build a project from
+different framework code depending on when - and whether - the
+download worked. When the download succeeded after upstream had
+moved on, the tool's own framework fixes could no longer find
+the code they patch, and the conversion failed before it
+started. Builds made with v1.0.23 or later always scaffold
+from the exact framework revision this version was tested
+with: the tool keeps its own pinned copy, the setup script's
+download is pointed at a dead local address so it cannot fetch
+live code, the pinned copy is put in its place, and the result
+is checked before the build proceeds - a scaffold that does
+not match stops the job with the reason instead of building
+from the wrong code.
+
 GAMES THAT STUTTER ON RUNTIME-LOADED CODE (IMPROVED IN v1.0.18)
 Some games load part of their code from the disc while they run
 (Gran Turismo and Tekken 1 are the known cases). That code cannot
