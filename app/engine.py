@@ -91,6 +91,20 @@ FRAMEWORK_URLS = {
     "recomp-ui": "https://github.com/RetroPortingToolKit/recomp-ui.git",
 }
 
+# The framework commits this release of the tool was built and tested
+# against (the folded fleet cache that produced the shipped library,
+# 2026-11). Scaffolding must be deterministic: a project is built from
+# these commits or from a local copy of them, never from live master -
+# in Wave 47 upstream's master renderer had drifted past the guest-grid
+# patcher's anchors and every job whose scaffold took the live clone
+# failed. Bump these pins deliberately, with a tool release, only
+# after the new framework passes the patchers and a verification
+# conversion.
+FRAMEWORK_PINS = {
+    "psxrecomp": "b263b8552e5b8838b317f8921dfde8b6aca97904",
+    "recomp-ui": "cf6315ad80af07d89b2ffc8656aeb5f819dd2baf",
+}
+
 
 def framework_cache():
     """App-managed framework download, used on machines with no finished
@@ -103,12 +117,87 @@ def _cache_ok(p):
             and (p / "recomp-ui").is_dir())
 
 
+def _git_head(p):
+    try:
+        res = subprocess.run(["git", "-C", str(p), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=30)
+        return res.stdout.strip() if res.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _framework_pin_ok(p, name):
+    """True when the framework tree at p is the pinned commit - or a
+    plain copy with no .git, the frozen form the scaffold itself
+    produces (copies are only ever made from a template or the cache).
+    A live clone sitting on any other commit is NOT ok: it is not the
+    framework this release was tested with."""
+    if not (p / ".git").exists():
+        return True
+    return _git_head(p) == FRAMEWORK_PINS[name]
+
+
+def _framework_cache_pinned():
+    cache = framework_cache()
+    return all(_framework_pin_ok(cache / name, name)
+               for name in FRAMEWORK_URLS)
+
+
+def _checkout_pin(dst, name, log):
+    """Check out the pinned commit in a framework clone and verify it.
+    Fetches first when the clone does not have the commit (a clone made
+    before the pin was set). Returns True only when HEAD is the pin
+    afterwards."""
+    pin = FRAMEWORK_PINS[name]
+    if _git_head(dst) == pin:
+        return True
+    res = subprocess.run(["git", "-C", str(dst), "checkout", "-q", pin],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        # --unshallow covers caches cloned --depth 1 by older tools;
+        # on a complete clone it errors harmlessly and is ignored.
+        subprocess.run(["git", "-C", str(dst), "fetch", "--quiet",
+                        "--unshallow", "origin"], capture_output=True,
+                       text=True)
+        res = subprocess.run(["git", "-C", str(dst), "checkout", "-q",
+                              pin], capture_output=True, text=True)
+    if res.returncode != 0:
+        log(f"could not check out pinned {name} commit {pin[:12]}: "
+            + (res.stderr or "")[-200:])
+        return False
+    subprocess.run(["git", "-C", str(dst), "submodule", "update",
+                    "--init", "--recursive"], capture_output=True,
+                   text=True)
+    if _git_head(dst) != pin:
+        log(f"pinned {name} checkout did not verify "
+            f"(HEAD is not {pin[:12]})")
+        return False
+    return True
+
+
 def ensure_framework_cache(log):
     """Download the framework once into framework-cache/ and return it
-    as a template. Returns None when git is missing or a clone fails."""
+    as a template. The download is PINNED (FRAMEWORK_PINS): a fresh
+    install gets exactly the framework this release was tested with,
+    never whatever master happens to be that day. Returns None when
+    git is missing, a clone fails, or the pinned commits cannot be
+    checked out and verified."""
     cache = framework_cache()
     if _cache_ok(cache):
-        return cache
+        if _framework_cache_pinned():
+            return cache
+        # A cache cloned by an older tool holds live master of its
+        # day - not the tested framework. Move it onto the pins in
+        # place; if that fails, refuse rather than scaffold from it.
+        moved = all(_checkout_pin(cache / name, name, log)
+                    for name in FRAMEWORK_URLS
+                    if (cache / name / ".git").exists())
+        if moved and _cache_ok(cache) and _framework_cache_pinned():
+            log("framework cache moved onto the pinned commits")
+            return cache
+        log("framework cache is not at the pinned commits and could "
+            "not be moved - refusing an untested framework")
+        return None
     if not shutil.which("git"):
         log("framework download needs git, which is not installed")
         return None
@@ -118,16 +207,14 @@ def ensure_framework_cache(log):
         if dst.is_dir() and any(dst.iterdir()):
             continue
         log(f"downloading framework: {url}")
-        try:
-            res = subprocess.run(["git", "clone", "--depth", "1",
-                                  "--recurse-submodules", url,
-                                  str(dst)], capture_output=True,
-                                 text=True, timeout=1800)
-        except subprocess.TimeoutExpired:
-            log("framework clone timed out after 1800s: " + url)
-            return None
+        res = subprocess.run(["git", "clone", "--recurse-submodules",
+                              url, str(dst)], capture_output=True,
+                             text=True)
         if res.returncode != 0:
             log("clone failed: " + (res.stderr or "")[-300:])
+            return None
+    for name in FRAMEWORK_URLS:
+        if not _checkout_pin(cache / name, name, log):
             return None
     return cache if _cache_ok(cache) else None
 
@@ -137,7 +224,7 @@ def find_template(override=""):
     can copy when the framework clone fails (it hangs often)."""
     if override and (Path(override) / "psxrecomp").is_dir():
         return Path(override)
-    if _cache_ok(framework_cache()):
+    if _cache_ok(framework_cache()) and _framework_cache_pinned():
         return framework_cache()
     ws = Path.home() / "workspace"
     cands = []
@@ -486,6 +573,108 @@ def patch_probe_preflight(template, log=print, fail_loud=False):
                 f"{template}: {e}") from e
         log(f"preflight probe patch skipped: {e}")
 
+
+EXE_PADDED_TAIL_MARKER = "zero bytes beyond header total"
+
+EXE_PADDED_TAIL_OLD_INC = "#include <fmt/core.h>"
+EXE_PADDED_TAIL_NEW_INC = "#include <fmt/core.h>\n#include <cstdio>"
+
+EXE_PADDED_TAIL_OLD = (
+    "    // Check file size matches buffer\n"
+    "    size_t expected_size = 2048 + exe.header.file_size;\n"
+    "    if (buffer.size() != expected_size) {\n"
+    "        error_msg = fmt::format(\n"
+    "            \"File size mismatch: header specifies {} bytes total (2048 + {}), got {}\",\n"
+    "            expected_size, exe.header.file_size, buffer.size()\n"
+    "        );\n"
+    "        return std::nullopt;\n"
+    "    }\n"
+)
+
+EXE_PADDED_TAIL_NEW = (
+    "    // Check file size matches buffer. Some retail discs pad the EXE\n"
+    "    // file out to a sector boundary with zero bytes past the\n"
+    "    // header-described image (Twisted Metal III SCUS_942.49: 153,600\n"
+    "    // zero bytes in both revisions) - mastering filler, not data.\n"
+    "    // Accept an oversize file whose tail past the header total is\n"
+    "    // entirely zero and use the header-defined image (the copy below\n"
+    "    // already reads exactly header.file_size bytes). Any non-zero\n"
+    "    // byte past the header total is appended data this parser cannot\n"
+    "    // account for: keep rejecting, as for an undersize file.\n"
+    "    size_t expected_size = 2048 + exe.header.file_size;\n"
+    "    if (buffer.size() != expected_size) {\n"
+    "        const bool zero_padded =\n"
+    "            buffer.size() > expected_size &&\n"
+    "            std::all_of(buffer.begin() + expected_size, buffer.end(),\n"
+    "                        [](uint8_t byte) { return byte == 0; });\n"
+    "        if (!zero_padded) {\n"
+    "            error_msg = fmt::format(\n"
+    "                \"File size mismatch: header specifies {} bytes total (2048 + {}), got {}\",\n"
+    "                expected_size, exe.header.file_size, buffer.size()\n"
+    "            );\n"
+    "            return std::nullopt;\n"
+    "        }\n"
+    "        std::fprintf(stderr,\n"
+    "                     \"padded EXE: %zu zero bytes beyond header total, \"\n"
+    "                     \"accepted\\n\",\n"
+    "                     buffer.size() - expected_size);\n"
+    "    }\n"
+)
+
+
+def patch_exe_padded_tail(template, log=print, fail_loud=False):
+    """Let the recompiler's PS-X EXE parser accept a boot EXE whose file
+    runs past its header total (2048 + t_size) when - and only when -
+    every overshoot byte is zero: mastering padding to a sector
+    boundary (Twisted Metal III SCUS_942.49 carries 153,600 zero bytes
+    in both revisions, and the queue run died on 'File size mismatch:
+    header specifies 501760 bytes total, got 655360'). The parser then
+    uses the header-defined image, exactly the bytes it always copied.
+    A non-zero tail is appended data and keeps being rejected, as is an
+    undersize file. Idempotent text patch on the template / framework
+    cache and on scaffolded projects (added 2026-11-12)."""
+    try:
+        src = Path(template) / "psxrecomp" / "recompiler" / "src" / \
+            "ps1_exe_parser.cpp"
+        if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"ps1_exe_parser.cpp missing under {template} - "
+                    f"cannot apply the padded-EXE parser patch")
+            return
+        text = src.read_text()
+        if EXE_PADDED_TAIL_MARKER in text:
+            return
+        pairs = [(EXE_PADDED_TAIL_OLD_INC, EXE_PADDED_TAIL_NEW_INC),
+                 (EXE_PADDED_TAIL_OLD, EXE_PADDED_TAIL_NEW)]
+        missing = [i for i, (old, _n) in enumerate(pairs)
+                   if old not in text]
+        if missing:
+            if fail_loud:
+                raise StageError(
+                    f"ps1_exe_parser.cpp in {template} does NOT take "
+                    f"the padded-EXE parser patch: {len(missing)} of "
+                    f"{len(pairs)} anchors missing {missing} - this "
+                    f"recompiler variant is not covered by this tool "
+                    f"version, and a zero-padded boot EXE (Twisted "
+                    f"Metal III class) would die at generate with a "
+                    f"file-size mismatch. Failing the job instead of "
+                    f"shipping it broken; update the tool or the "
+                    f"template.")
+            return
+        for old, new in pairs:
+            text = text.replace(old, new, 1)
+        src.write_text(text)
+        log("patched ps1_exe_parser.cpp: zero-padded oversize EXEs "
+            "accepted (header-defined image used)")
+    except StageError:
+        raise
+    except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"padded-EXE parser patch failed on "
+                f"{template}: {e}") from e
+        log(f"padded-EXE parser patch skipped: {e}")
 
 def patch_overlay_draw_chain(template, log=print, fail_loud=False):
     """Let the in-game menu and the RetroAchievements pop-ups share the
@@ -1419,6 +1608,61 @@ def fetch_cover(cue, dest_dir, serial=""):
 
 # ---------------------------------------------------------------- stages
 
+# Each framework tree's build entry: the file whose presence marks a
+# complete tree (psxrecomp has no top-level CMakeLists.txt; the
+# project skeleton guards on runtime/runtime.cmake).
+_FRAMEWORK_ENTRIES = {
+    "psxrecomp": Path("runtime") / "CMakeLists.txt",
+    "recomp-ui": Path("CMakeLists.txt"),
+}
+
+
+def _framework_tree_stale(repo_tree, template_tree, entry):
+    """A scaffolded framework tree must be replaced by the template's
+    copy when it is missing its build entry, still carries a .git (it
+    came from a clone, not from the template copy), or its GL renderer
+    - the file whose upstream drift failed Wave 47 - differs from the
+    template's."""
+    if not (repo_tree / entry).exists():
+        return True
+    if (repo_tree / ".git").exists():
+        return True
+    rend = Path("runtime") / "src" / "gpu_gl_renderer.c"
+    a, b = repo_tree / rend, template_tree / rend
+    if a.exists() and b.exists():
+        return a.read_bytes() != b.read_bytes()
+    return False
+
+
+def _ensure_template_framework(r, repo, template):
+    """Guarantee the scaffolded project's framework trees are the
+    template's copies (see stage_scaffold): replace anything the
+    scaffold script cloned or left partial, then verify."""
+    for tree, entry in _FRAMEWORK_ENTRIES.items():
+        src, dst = template / tree, repo / tree
+        if not src.is_dir():
+            continue
+        if dst.is_dir() and not _framework_tree_stale(dst, src, entry):
+            continue
+        if dst.exists():
+            r.log(f"scaffold {tree} is not the template copy - "
+                  "replacing it")
+            shutil.rmtree(dst)
+        else:
+            r.log("framework missing after scaffold - copying "
+                  f"from template: {tree}")
+        shutil.copytree(src, dst,
+                        ignore=shutil.ignore_patterns(".git"))
+    for tree, entry in _FRAMEWORK_ENTRIES.items():
+        if (template / tree).is_dir() and \
+                _framework_tree_stale(repo / tree, template / tree,
+                                      entry):
+            raise StageError(
+                f"scaffold {tree} does not match the template "
+                "framework after copying - refusing to build on an "
+                "unverified framework")
+
+
 def stage_scaffold(r, job, template):
     root, repo = job.root, job.repo
     # setup_project.sh refuses to create into an existing target dir,
@@ -1429,23 +1673,35 @@ def stage_scaffold(r, job, template):
     root.mkdir(parents=True, exist_ok=True)
     layout = template / "psxrecomp" / "tools" / "new_project_layout"
     cue = job.cues[0]
-    # setup_project.sh builds the skeleton and tries to clone the
-    # framework; the clone hangs on some networks, so cap it and fall
-    # back to copying the template's framework trees.
+    # setup_project.sh clones the framework from live GitHub master
+    # (PSXRECOMP_URL / RECOMP_UI_URL, refs defaulting to master) -
+    # nondeterministic, and in Wave 47 upstream's drifted renderer
+    # missed the guest-grid patcher's anchors and failed every job
+    # whose scaffold took the clone. The framework a project is built
+    # from is the TEMPLATE's copy, full stop: point the script's clone
+    # at a dead local path so it fails instantly and the template copy
+    # below always engages. Values already in the environment (the
+    # fleet's launch scripts export the same dead paths) are kept -
+    # and _ensure_template_framework replaces even a successful
+    # override clone with the template trees, so no run can scaffold
+    # from anything else.
+    env = {}
+    for var, dead in (("PSXRECOMP_URL", "/nonexistent/psxrecomp.git"),
+                      ("RECOMP_UI_URL", "/nonexistent/recomp-ui.git")):
+        if var not in os.environ:
+            env[var] = dead
+    if env:
+        r.log("scaffold framework pinned to the template copy "
+              "(live clone disabled)")
     try:
         prefix = ["timeout", "180"] if shutil.which("timeout") else []
         r.run([*prefix, layout / "setup_project.sh", "--disc", cue,
                "--dir", root, "--name", job.name,
                "--players", job.settings.players or 1,
-               "--enable-recomp-ui", "--yes"], cwd=layout)
+               "--enable-recomp-ui", "--yes"], cwd=layout, env=env)
     except StageError as ex:
         r.log(f"scaffold script issue ({ex}); continuing with local copy")
-    if not (repo / "psxrecomp" / "CMakeLists.txt").exists():
-        r.log("framework missing after scaffold - copying from template")
-        for tree in ("psxrecomp", "recomp-ui"):
-            src, dst = template / tree, repo / tree
-            if src.is_dir() and not dst.is_dir():
-                shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+    _ensure_template_framework(r, repo, template)
     if not (repo / "CMakeLists.txt").exists():
         raise StageError("scaffold produced no CMakeLists.txt")
     (root / "game").mkdir(exist_ok=True)
@@ -2690,6 +2946,7 @@ def run_job(job, log, stop_after=None):
     patch_gpu_depth24_hold(template, log, fail_loud=True)
     patch_sw_guest_grid(template, log, fail_loud=True)
     patch_gl_guest_grid(template, log, fail_loud=True)
+    patch_exe_padded_tail(template, log, fail_loud=True)
     if len(job.cues) > 1:
         # Disc-set routing BEFORE any building: probe every disc and
         # check the set. One program -> fall through and build ONE
@@ -2744,7 +3001,9 @@ def run_job(job, log, stop_after=None):
                               patch_sw_guest_grid(job.repo, log,
                                                   fail_loud=True),
                               patch_gl_guest_grid(job.repo, log,
-                                                  fail_loud=True))),
+                                                  fail_loud=True),
+                              patch_exe_padded_tail(job.repo, log,
+                                                    fail_loud=True))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
         ("ra", lambda: stage_ra(r, job)),
