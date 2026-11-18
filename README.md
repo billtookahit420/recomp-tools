@@ -43,6 +43,45 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.23 (2026-11-17)** — Scaffold determinism: a conversion
+  no longer builds from whatever the framework's newest revision
+  happens to be that day. The framework's setup script cloned
+  psxrecomp and recomp-ui from GitHub master on every scaffold,
+  so the same tool version produced different projects depending
+  on the day and the network — in practice it only worked when
+  the clone hung and the engine fell back to copying a template.
+  When the clone succeeded on the build fleet (Wave 47,
+  2026-11-17), upstream's drifted GL renderer missed the
+  guest-grid patcher's anchors and every affected job failed
+  before it started. Now the scaffold always builds from the
+  tool's own pinned framework copy: the one-time framework
+  download is pinned to the exact commits this version was
+  tested with (psxrecomp `b263b855`, recomp-ui `cf6315a`), the
+  setup script's clone is pointed at a dead local path so it
+  cannot fetch live code, any framework tree the script still
+  manages to produce is replaced by the pinned copy, and the
+  result is verified before the build proceeds. A framework
+  cache sitting on any other commit is moved onto the pins or
+  refused. The fail-loud patcher anchor checks are unchanged.
+  Verified before release: clean-room scaffolds with a bogus
+  framework address and with no framework environment at all
+  both finish from the pinned copy with framework trees
+  byte-identical to the pinned template, and a full clean-room
+  conversion of Tiny Toon Adventures - The Great Beanstalk on
+  the release tree reproduced the fleet-verified package
+  profile (639 game functions, guard staging, eyeball pass).
+  The fix has run the build fleet's production waves since
+  2026-11-17 (first title filed under it: Barbie - Explorer).
+  Also in this release: the padded-EXE parser fix the build
+  fleet has run since 2026-11-12 reaches the published tool —
+  v1.0.22's probe already classified PADDED-EXE discs (the
+  Twisted Metal III class: boot EXE padded past its header
+  total with zero bytes); the recompiler's EXE parser now
+  accepts such a file when every overshoot byte is zero and
+  uses the header-defined image, and keeps rejecting a
+  non-zero tail as appended data it cannot account for.
+  Windows packages are compile-verified only, as before.
+
 - **v1.0.22 (2026-11-12)** — Packages can arm the text-image
   guard, pre-flight probe classification, and the OpenGL
   guest-grid v2 phase. (1) Guard packaging: stage_package now
@@ -292,8 +331,10 @@ UI and RetroAchievements wired in.
 
 - Conversions run **one game at a time** on purpose: parallel Generate
   stages run out of RAM, and serial runs keep failures contained.
-- The framework is copied from a *template project* (any finished
-  recomp) when the online clone fails — pick one in the settings if
-  auto-detect finds none.
+- The framework comes from the tool's own pinned framework
+  cache — downloaded once, at the exact commits this version was
+  tested with, never from live upstream. A finished project's
+  copy can still serve as the template; it is verified against
+  the pins before use.
 - Windows `.exe` packaging needs PyInstaller on a Windows machine;
   the app itself is one cross-platform codebase.
