@@ -43,6 +43,32 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.25 (2026-11-19)** — Packaging license fix: a
+  conversion could build and verify completely, then fail at
+  the packaging step with "guard staging incomplete ...
+  licenses/psxrecomp-LICENSE missing from the staged
+  package". The packager sourced the framework license files
+  bundled into every package solely from the framework cache
+  beside the tool install, but that cache is only provisioned
+  when the scaffold finds no template project — on a machine
+  with finished projects in ~/workspace (the normal case for
+  anyone who has converted games before), the template is one
+  of those projects and the cache was never created. Every
+  license copy then skipped silently, and the final guard
+  failed the job after the full build. The packager now
+  sources the license files from the scaffolded project's
+  own framework trees — the exact framework the game was
+  built from — falling back to the cache, and a license
+  source missing from both places now fails the job naming
+  the expected source path instead of silently staging an
+  incomplete package. Verified in the configuration that
+  failed in the field (finished projects in ~/workspace, no
+  framework-cache): the previous build reproduces the
+  failure there and this build packages with the full
+  license set; with a populated cache present, the packaged
+  license set is unchanged. Projects that already built and
+  hit this failure re-package from their existing build trees
+  without rebuilding.
 - **v1.0.24 (2026-11-19)** — Codegen memory fix: the code
   generator no longer blows up on games whose code contains a
   large functionless data region with thousands of stray branch
