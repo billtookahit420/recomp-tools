@@ -43,6 +43,22 @@ UI and RetroAchievements wired in.
 
 ## Changes
 
+- **v1.0.24 (2026-11-19)** — Codegen memory fix: the code
+  generator no longer blows up on games whose code contains a
+  large functionless data region with thousands of stray branch
+  targets. Each target's generated function used to span the
+  whole remaining region, so the generator retained thousands
+  of overlapping copies of the same region at once — Kingsley's
+  Adventure (SLUS-00801) peaked at 30.77 GB and was OOM-killed
+  during generation. Gap functions now partition their gap,
+  each ending at the next target in the same gap, so the region
+  is covered once. A gap with at most one target produces
+  exactly the function it did before, so ordinary titles
+  generate identical code — verified byte-identical on Tiny
+  Toon Adventures - The Great Beanstalk. Kingsley's Adventure
+  now converts end to end (generation peaks at ~338 MB) and is
+  filed on the build fleet's shelf. The fix has run the build
+  fleet's production tool since 2026-11-18.
 - **v1.0.23 (2026-11-17)** — Scaffold determinism: a conversion
   no longer builds from whatever the framework's newest revision
   happens to be that day. The framework's setup script cloned
