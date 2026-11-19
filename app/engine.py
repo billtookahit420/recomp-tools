@@ -1466,6 +1466,111 @@ def patch_gl_guest_grid(template, log=print, fail_loud=False):
                 f"{e}") from e
         log(f"gl guest-grid patch skipped: {e}")
 
+CODEGEN_GAP_PARTITION_MARKER = "Gap targets partition their gap"
+
+CODEGEN_GAP_OLD_A = """            for (uint32_t target : gap_targets) {
+                auto next_it = std::upper_bound(func_starts.begin(), func_starts.end(), target);
+                uint32_t gap_end = (next_it != func_starts.end()) ? *next_it : exe_end;
+                if (target >= gap_end) continue;
+"""
+
+CODEGEN_GAP_NEW_A = """            // Gap targets partition their gap: each gap function ends at
+            // the next gap target in the same gap (or at the end of the
+            // gap). Minting every gap function with the full remaining
+            // suffix of the gap made K targets in one gap retain K
+            // overlapping full-suffix CFGs - O(K * gap) blocks (Kingsley:
+            // ~2.5K suffixes x ~15K blocks = 28M blocks, ~6.4 GB, in
+            // pre-pass 1 alone). A single-target gap is unchanged.
+            std::vector<uint32_t> gap_list(gap_targets.begin(), gap_targets.end());
+            for (size_t gi = 0; gi < gap_list.size(); gi++) {
+                uint32_t target = gap_list[gi];
+                auto next_it = std::upper_bound(func_starts.begin(), func_starts.end(), target);
+                uint32_t gap_end = (next_it != func_starts.end()) ? *next_it : exe_end;
+                if (target >= gap_end) continue;
+
+                uint32_t piece_end = gap_end;
+                if (gi + 1 < gap_list.size()) {
+                    uint32_t nt = gap_list[gi + 1];
+                    auto nnext_it = std::upper_bound(func_starts.begin(), func_starts.end(), nt);
+                    uint32_t n_gap_end = (nnext_it != func_starts.end()) ? *nnext_it : exe_end;
+                    if (n_gap_end == gap_end && nt > target && nt < gap_end)
+                        piece_end = nt;
+                }
+"""
+
+CODEGEN_GAP_OLD_B = """                Function nf;
+                nf.start_addr = target;
+                nf.end_addr = gap_end;"""
+
+CODEGEN_GAP_NEW_B = """                Function nf;
+                nf.start_addr = target;
+                nf.end_addr = piece_end;"""
+
+
+def patch_codegen_gap_partition(template, log=print, fail_loud=False):
+    """Stop the code generator's split pre-pass from minting one
+    full-suffix function per stray branch target into a functionless
+    gap. Upstream generate_file ends every gap target's function at
+    the NEXT FUNCTION START, so K targets inside one large gap retain
+    K overlapping CFGs over the whole remaining gap - O(K x gap)
+    basic blocks, all held at once. Kingsley's Adventure (SLUS-00801)
+    has a ~143 KB functionless data gap with ~2.5K stray targets into
+    it: pre-pass 1 alone built 28.1M blocks (~6.4 GB retained) and
+    generation then tried to emit ~2.5K copies of the same region,
+    OOM-killing the generator at 30.77 GB RSS (Wave 54). The patch
+    makes gap targets partition their gap exactly the way split
+    targets partition a function: each gap function ends at the next
+    gap target in the same gap, or at the gap end for the last one.
+    A gap with at most one target yields a field-for-field identical
+    Function, so titles without a multi-target gap generate exactly
+    as before. Idempotent text patch on the template / framework
+    cache and on scaffolded projects (found 2026-11-18; scratch
+    proof: Kingsley codegen completes at ~340 MB peak, framework
+    codegen tests pass)."""
+    try:
+        src = Path(template) / "psxrecomp" / "recompiler" / "src" / \
+            "code_generator.cpp"
+        if not src.exists():
+            if fail_loud:
+                raise StageError(
+                    f"code_generator.cpp missing under {template} - "
+                    f"cannot apply the codegen gap-partition patch")
+            return
+        text = src.read_text()
+        if CODEGEN_GAP_PARTITION_MARKER in text:
+            return
+        pairs = [(CODEGEN_GAP_OLD_A, CODEGEN_GAP_NEW_A),
+                 (CODEGEN_GAP_OLD_B, CODEGEN_GAP_NEW_B)]
+        missing = [i for i, (old, _n) in enumerate(pairs)
+                   if old not in text]
+        if missing:
+            if fail_loud:
+                raise StageError(
+                    f"code_generator.cpp in {template} does NOT take "
+                    f"the codegen gap-partition patch: {len(missing)} "
+                    f"of {len(pairs)} anchors missing {missing} - this "
+                    f"recompiler variant is not covered by this tool "
+                    f"version, and a title with a large multi-target "
+                    f"data gap (Kingsley's Adventure class) would be "
+                    f"OOM-killed at generate. Failing the job instead "
+                    f"of shipping it broken; update the tool or the "
+                    f"template.")
+            return
+        for old, new in pairs:
+            text = text.replace(old, new, 1)
+        src.write_text(text)
+        log("patched code_generator.cpp: gap targets partition their "
+            "gap (Kingsley codegen OOM fix)")
+    except StageError:
+        raise
+    except Exception as e:  # a patch failure must never break a run
+        if fail_loud:
+            raise StageError(
+                f"codegen gap-partition patch failed on "
+                f"{template}: {e}") from e
+        log(f"codegen gap-partition patch skipped: {e}")
+
+
 def probe_cue(runner, cue, template, players=1, json_out=None):
     patch_probe_subdir_boot(template,
                             getattr(runner, "log", print))
@@ -2947,6 +3052,7 @@ def run_job(job, log, stop_after=None):
     patch_sw_guest_grid(template, log, fail_loud=True)
     patch_gl_guest_grid(template, log, fail_loud=True)
     patch_exe_padded_tail(template, log, fail_loud=True)
+    patch_codegen_gap_partition(template, log, fail_loud=True)
     if len(job.cues) > 1:
         # Disc-set routing BEFORE any building: probe every disc and
         # check the set. One program -> fall through and build ONE
@@ -3003,6 +3109,8 @@ def run_job(job, log, stop_after=None):
                               patch_gl_guest_grid(job.repo, log,
                                                   fail_loud=True),
                               patch_exe_padded_tail(job.repo, log,
+                                                    fail_loud=True),
+                              patch_codegen_gap_partition(job.repo, log,
                                                     fail_loud=True))),
         ("probe", lambda: stage_probe(r, job, template)),
         ("patch", lambda: stage_patch_cmake(r, job)),
