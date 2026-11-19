@@ -2922,23 +2922,55 @@ def stage_package(r, job):
         disc_dst = stage / "disc" / boot_exe
         disc_dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(disc_src, disc_dst)
+        # License sources: the project's own framework trees first -
+        # the framework this game was actually built from, which
+        # every scaffolded repo carries in full - with the framework
+        # cache only as a fallback. v1.0.24 and earlier read these
+        # solely from the cache, but the cache is provisioned only
+        # when no template project exists; on a machine whose
+        # template comes from a finished ~/workspace project the
+        # cache was never created, every copy below silently
+        # skipped, and the guard tripped after a full build.
         fw = framework_cache()
         lic = stage / "licenses"
         lic.mkdir(exist_ok=True)
-        notices = fw / "psxrecomp" / "runtime" / "licenses"
-        if notices.is_dir():
-            for f in sorted(notices.iterdir()):
-                if f.is_file():
-                    shutil.copy2(f, lic / f.name)
-        for src_file, dst_name in (
-                (fw / "psxrecomp" / "THIRD_PARTY_ATTRIBUTION.md",
+
+        def license_source(*parts):
+            for root in (repo, fw):
+                cand = root.joinpath(*parts)
+                if cand.is_file():
+                    return cand
+            return None
+
+        notices = None
+        for root in (repo, fw):
+            cand = root / "psxrecomp" / "runtime" / "licenses"
+            if cand.is_dir():
+                notices = cand
+                break
+        if notices is None:
+            raise StageError(
+                f"license notices folder missing: expected "
+                f"{repo / 'psxrecomp' / 'runtime' / 'licenses'} or "
+                f"{fw / 'psxrecomp' / 'runtime' / 'licenses'}")
+        for f in sorted(notices.iterdir()):
+            if f.is_file():
+                shutil.copy2(f, lic / f.name)
+        for parts, dst_name in (
+                (("psxrecomp", "THIRD_PARTY_ATTRIBUTION.md"),
                  "THIRD_PARTY_ATTRIBUTION.md"),
-                (fw / "psxrecomp" / "LICENSE", "psxrecomp-LICENSE"),
-                (fw / "psxrecomp" / "PERMISSIONS.md",
+                (("psxrecomp", "LICENSE"), "psxrecomp-LICENSE"),
+                (("psxrecomp", "PERMISSIONS.md"),
                  "psxrecomp-PERMISSIONS.md"),
-                (fw / "recomp-ui" / "LICENSE", "recomp-ui-LICENSE")):
-            if src_file.is_file():
-                shutil.copy2(src_file, lic / dst_name)
+                (("recomp-ui", "LICENSE"), "recomp-ui-LICENSE")):
+            src_file = license_source(*parts)
+            if src_file is None:
+                raise StageError(
+                    f"license file missing: expected "
+                    f"{repo.joinpath(*parts)} or "
+                    f"{fw.joinpath(*parts)} "
+                    f"(staged as licenses/{dst_name})")
+            shutil.copy2(src_file, lic / dst_name)
         if not disc_dst.is_file() \
                 or not (lic / "psxrecomp-LICENSE").is_file():
             raise StageError(
