@@ -164,6 +164,20 @@ waiting list until its own result arrives. This covers "Add
 Disc" and "Add Disc Set" too - every add shares the same
 chain.
 
+CONVERSIONS THAT RAN OUT OF MEMORY (FIXED IN v1.0.24)
+Some games carry a large stretch of data with no code in it
+that thousands of stray jumps point into. The code generator
+treated every one of those jumps as the start of a function
+running to the end of the stretch, so it rebuilt the same
+region thousands of times and kept every copy in memory at
+once. On Kingsley's Adventure the generator's memory use
+passed 30 GB and the system killed it, so the game could not
+be converted at all. Builds made with v1.0.24 or later make
+those functions share the stretch - each one ends where the
+next begins - so the region is covered once: Kingsley's
+Adventure now generates using about 340 MB, and games without
+such a stretch generate exactly the code they did before.
+
 CONVERSIONS THAT FAILED BEFORE THEY STARTED (FIXED IN v1.0.23)
 Every conversion begins by scaffolding a fresh project from the
 PSXRecomp framework. The framework's setup script downloaded the
