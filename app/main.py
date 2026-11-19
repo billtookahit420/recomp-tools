@@ -164,6 +164,26 @@ waiting list until its own result arrives. This covers "Add
 Disc" and "Add Disc Set" too - every add shares the same
 chain.
 
+CONVERSIONS THAT FAILED AT THE LAST STEP (FIXED IN v1.0.25)
+A conversion could build and verify completely, then fail
+while packaging with "guard staging incomplete ...
+licenses/psxrecomp-LICENSE missing". The packager took the
+framework license files it bundles into every package from a
+framework cache folder beside the tool - but that cache is
+only created when the tool cannot find a template among your
+finished projects. On a machine that already had converted
+projects in its workspace, the cache was never created, the
+license copies were skipped without a word, and the final
+check failed the job after the whole build. Builds made with
+v1.0.25 or later take the license files from each project's
+own framework copy - the exact framework the game was built
+from - with the cache as a fallback, and a license file that
+is missing everywhere now stops the job naming the place it
+was expected instead of failing silently at the end.
+Projects that already built and hit this failure do not need
+to be rebuilt: re-running them packages from the existing
+build.
+
 CONVERSIONS THAT RAN OUT OF MEMORY (FIXED IN v1.0.24)
 Some games carry a large stretch of data with no code in it
 that thousands of stray jumps point into. The code generator
